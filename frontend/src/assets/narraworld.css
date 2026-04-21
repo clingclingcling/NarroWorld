@@ -1,0 +1,329 @@
+:root {
+  --nw-bg: #0d1016;
+  --nw-panel: rgba(19, 24, 34, 0.84);
+  --nw-panel-strong: rgba(16, 21, 29, 0.96);
+  --nw-panel-soft: rgba(33, 41, 57, 0.52);
+  --nw-border: rgba(213, 222, 255, 0.12);
+  --nw-border-strong: rgba(235, 173, 112, 0.35);
+  --nw-text: #eef2ff;
+  --nw-text-soft: #a7b2cc;
+  --nw-accent: #ef8f48;
+  --nw-accent-2: #67b1ff;
+  --nw-good: #88d2ad;
+  --nw-bad: #ff8f88;
+  --nw-shadow: 0 20px 60px rgba(0, 0, 0, 0.35);
+  --nw-radius-xl: 28px;
+  --nw-radius-lg: 22px;
+  --nw-radius-md: 16px;
+  --nw-font-display: "Space Grotesk", "Noto Sans SC", sans-serif;
+  --nw-font-body: "Noto Sans SC", "Inter", sans-serif;
+  --nw-font-mono: "JetBrains Mono", monospace;
+}
+
+body {
+  background:
+    radial-gradient(circle at top left, rgba(103, 177, 255, 0.16), transparent 28%),
+    radial-gradient(circle at bottom right, rgba(239, 143, 72, 0.18), transparent 22%),
+    linear-gradient(180deg, #0d1016, #121824 58%, #111722);
+  color: var(--nw-text);
+  font-family: var(--nw-font-body);
+}
+
+a {
+  color: inherit;
+}
+
+.nw-page {
+  min-height: 100vh;
+  color: var(--nw-text);
+}
+
+.nw-shell {
+  max-width: 1440px;
+  margin: 0 auto;
+  padding: 26px;
+}
+
+.nw-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 18px;
+  padding: 18px 24px;
+  border: 1px solid var(--nw-border);
+  background: rgba(7, 10, 16, 0.65);
+  border-radius: var(--nw-radius-xl);
+  backdrop-filter: blur(18px);
+  box-shadow: var(--nw-shadow);
+}
+
+.nw-brand {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  cursor: pointer;
+}
+
+.nw-brand-mark {
+  font-family: var(--nw-font-display);
+  font-size: 26px;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+}
+
+.nw-brand-tag {
+  font-size: 12px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--nw-text-soft);
+}
+
+.nw-nav,
+.nw-actions,
+.nw-tabs,
+.nw-pill-row,
+.nw-tag-row {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.nw-link,
+.nw-btn,
+.nw-tab {
+  border: 1px solid var(--nw-border);
+  background: rgba(255, 255, 255, 0.03);
+  color: var(--nw-text);
+  border-radius: 999px;
+  padding: 10px 16px;
+  font: inherit;
+  cursor: pointer;
+  transition: 180ms ease;
+}
+
+.nw-btn.primary,
+.nw-tab.active {
+  background: linear-gradient(135deg, rgba(239, 143, 72, 0.95), rgba(103, 177, 255, 0.9));
+  color: #081019;
+  border-color: transparent;
+  font-weight: 700;
+}
+
+.nw-btn:hover,
+.nw-link:hover,
+.nw-tab:hover {
+  transform: translateY(-1px);
+  border-color: var(--nw-border-strong);
+}
+
+.nw-grid-2,
+.nw-grid-3 {
+  display: grid;
+  gap: 18px;
+}
+
+.nw-grid-2 {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.nw-grid-3 {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.nw-card {
+  border: 1px solid var(--nw-border);
+  background: var(--nw-panel);
+  border-radius: var(--nw-radius-lg);
+  padding: 22px;
+  backdrop-filter: blur(14px);
+  box-shadow: var(--nw-shadow);
+}
+
+.nw-card.strong {
+  background: var(--nw-panel-strong);
+}
+
+.nw-card-title {
+  font-family: var(--nw-font-display);
+  font-size: 24px;
+  font-weight: 600;
+  margin-bottom: 8px;
+}
+
+.nw-kicker {
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  color: var(--nw-accent);
+  margin-bottom: 10px;
+}
+
+.nw-subtle {
+  color: var(--nw-text-soft);
+  line-height: 1.7;
+}
+
+.nw-pill {
+  border-radius: 999px;
+  padding: 6px 10px;
+  background: rgba(103, 177, 255, 0.14);
+  color: var(--nw-text);
+  font-size: 12px;
+}
+
+.nw-input,
+.nw-select,
+.nw-textarea {
+  width: 100%;
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--nw-text);
+  border: 1px solid var(--nw-border);
+  border-radius: 16px;
+  padding: 14px 16px;
+  font: inherit;
+}
+
+.nw-input::placeholder,
+.nw-textarea::placeholder {
+  color: rgba(234, 239, 255, 0.45);
+}
+
+.nw-label {
+  display: block;
+  margin-bottom: 8px;
+  color: var(--nw-text-soft);
+  font-size: 12px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.nw-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.nw-list-item {
+  padding: 14px 16px;
+  border-radius: 18px;
+  border: 1px solid var(--nw-border);
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.nw-chat {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  max-height: 72vh;
+  overflow-y: auto;
+}
+
+.nw-message {
+  border-radius: 18px;
+  padding: 14px 16px;
+  border: 1px solid var(--nw-border);
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.nw-message.character {
+  border-color: rgba(103, 177, 255, 0.22);
+}
+
+.nw-message.system,
+.nw-message.scene,
+.nw-message.clue,
+.nw-message.decision {
+  border-color: rgba(239, 143, 72, 0.2);
+}
+
+.nw-message.player {
+  background: rgba(103, 177, 255, 0.14);
+  align-self: flex-end;
+}
+
+.nw-message-meta {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  color: var(--nw-text-soft);
+  font-size: 12px;
+  margin-bottom: 6px;
+}
+
+.nw-sidebar {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+.nw-stat-grid {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+}
+
+.nw-stat {
+  border: 1px solid var(--nw-border);
+  border-radius: 18px;
+  padding: 16px;
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.nw-stat-label {
+  font-size: 12px;
+  text-transform: uppercase;
+  color: var(--nw-text-soft);
+  margin-bottom: 8px;
+}
+
+.nw-stat-value {
+  font-family: var(--nw-font-display);
+  font-size: 26px;
+  font-weight: 700;
+}
+
+.nw-two-pane {
+  display: grid;
+  grid-template-columns: 320px minmax(0, 1fr) 320px;
+  gap: 18px;
+}
+
+.nw-timeline {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.nw-hero {
+  display: grid;
+  grid-template-columns: 1.1fr 0.9fr;
+  gap: 20px;
+}
+
+.nw-hero-title {
+  font-family: var(--nw-font-display);
+  font-size: clamp(42px, 7vw, 72px);
+  line-height: 1.02;
+  letter-spacing: -0.05em;
+}
+
+.nw-hero-title span {
+  color: var(--nw-accent);
+}
+
+.nw-footer-nav {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 14px;
+}
+
+@media (max-width: 1180px) {
+  .nw-grid-3,
+  .nw-two-pane,
+  .nw-hero,
+  .nw-grid-2,
+  .nw-footer-nav {
+    grid-template-columns: 1fr;
+  }
+}
