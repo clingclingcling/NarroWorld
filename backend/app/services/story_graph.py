@@ -80,13 +80,15 @@ class NarrativeGraphService:
             edges.append(edge)
 
         for character in story_data.get("characters", []):
+            entity_type = character.get("entity_type", "character")
             add_node(
                 StoryNode(
                     id=character["id"],
                     label=character.get("canonical_name") or character["name"],
-                    type="Character",
+                    type="Faction" if entity_type == "organization" else "Character",
                     summary=character.get("summary") or character.get("persona", ""),
                     metadata={
+                        "entity_type": entity_type,
                         "aliases": character.get("aliases", []),
                         "role": character.get("role", ""),
                         "role_type": character.get("role_type", ""),
@@ -108,6 +110,9 @@ class NarrativeGraphService:
                     summary=event.get("summary", ""),
                     status=event.get("status", "pending"),
                     metadata={
+                        "actor": event.get("actor", ""),
+                        "action": event.get("action", ""),
+                        "target": event.get("target", ""),
                         "order": event.get("order", 0),
                         "event_type": event.get("event_type", "plot"),
                         "trigger_conditions": event.get("trigger_conditions", []),

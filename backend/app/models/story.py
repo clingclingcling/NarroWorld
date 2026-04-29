@@ -6,9 +6,11 @@ import json
 import os
 import re
 import shutil
+import tempfile
 import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
+from json import JSONDecodeError
 from typing import Any, Dict, List, Optional
 
 from ..config import Config
@@ -43,6 +45,7 @@ class StoryCharacter:
     id: str
     name: str
     canonical_name: str = ""
+    entity_type: str = "character"
     aliases: List[str] = field(default_factory=list)
     role: str = ""
     role_type: str = ""
@@ -57,6 +60,9 @@ class StoryCharacter:
     knowledge_scope: List[str] = field(default_factory=list)
     importance_score: float = 0.5
     status: str = "active"
+    review_source: str = "heuristic"
+    review_verdict: str = "keep"
+    review_notes: List[str] = field(default_factory=list)
     evidence: List[EvidenceRef] = field(default_factory=list)
 
 
@@ -77,6 +83,9 @@ class StoryEvent:
     title: str
     summary: str
     order: int
+    actor: str = ""
+    action: str = ""
+    target: str = ""
     event_type: str = "plot"
     participants: List[str] = field(default_factory=list)
     scenes: List[str] = field(default_factory=list)
@@ -146,6 +155,44 @@ class WorldRule:
 
 
 @dataclass
+class NarrativeBlock:
+    id: str
+    title: str
+    summary: str
+    situation: str = ""
+    conflict: str = ""
+    player_implication: str = ""
+    risk: str = ""
+    objective: str = ""
+    action_vectors: List[str] = field(default_factory=list)
+    event_ids: List[str] = field(default_factory=list)
+    participant_ids: List[str] = field(default_factory=list)
+    clue_ids: List[str] = field(default_factory=list)
+    scene_id: Optional[str] = None
+    phase: str = "setup"
+    evidence: List[EvidenceRef] = field(default_factory=list)
+
+
+@dataclass
+class PlayableBeat:
+    beat_id: str
+    source_event_ids: List[str] = field(default_factory=list)
+    source_block_id: Optional[str] = None
+    importance: str = "minor"
+    first_person_situation: str = ""
+    player_objective: str = ""
+    dramatic_question: str = ""
+    present_character_ids: List[str] = field(default_factory=list)
+    suggested_action_intents: List[str] = field(default_factory=list)
+    revealed_clue_ids: List[str] = field(default_factory=list)
+    risk_summary: str = ""
+    should_render_full_turn: bool = True
+    scene_id: Optional[str] = None
+    phase: str = "setup"
+    evidence: List[EvidenceRef] = field(default_factory=list)
+
+
+@dataclass
 class StoryNode:
     id: str
     label: str
@@ -184,6 +231,9 @@ class CharacterRuntimeState:
     belief_state: List[str] = field(default_factory=list)
     relationship_state: Dict[str, str] = field(default_factory=dict)
     action_policy: str = ""
+    speech_style: str = ""
+    risk_profile: str = ""
+    value_guardrails: List[str] = field(default_factory=list)
     knowledge_scope: List[str] = field(default_factory=list)
     current_intent: str = ""
     last_action: str = ""
@@ -195,6 +245,10 @@ class DecisionOption:
     id: str
     label: str
     impact: str = ""
+    risk: str = ""
+    action_type: str = ""
+    target_character_id: Optional[str] = None
+    target_clue_id: Optional[str] = None
     target_event_id: Optional[str] = None
 
 
@@ -222,14 +276,32 @@ class PlayMessage:
 
 
 @dataclass
+class PlayEventQueueEntry:
+    event_id: str
+    status: str = "pending"
+    importance: str = "minor"
+    source_block_id: Optional[str] = None
+    reason: str = ""
+    debug_reason: str = ""
+    turn_generated: bool = False
+    priority: float = 0.0
+
+
+@dataclass
 class PlayState:
     session_started: bool = False
     auto_mode: bool = True
+    protagonist_id: Optional[str] = None
+    protagonist_name: str = ""
     active_plot_node_id: Optional[str] = None
     current_scene_id: Optional[str] = None
     pending_messages: List[PlayMessage] = field(default_factory=list)
     feed: List[PlayMessage] = field(default_factory=list)
+    event_queue: List[PlayEventQueueEntry] = field(default_factory=list)
+    current_turn: Optional[Dict[str, Any]] = None
+    turn_history: List[Dict[str, Any]] = field(default_factory=list)
     current_decision: Optional[PlotNode] = None
+    latest_feedback: Optional[Dict[str, Any]] = None
     unlocked_tasks: List[str] = field(default_factory=list)
     last_tick_at: str = field(default_factory=_now_iso)
 
@@ -266,6 +338,7 @@ class StoryWorld:
     summary: str = ""
     main_storyline: str = ""
     characters: List[StoryCharacter] = field(default_factory=list)
+    character_registry: Dict[str, Any] = field(default_factory=dict)
     relationships: List[StoryRelationship] = field(default_factory=list)
     events: List[StoryEvent] = field(default_factory=list)
     scenes: List[StoryScene] = field(default_factory=list)
@@ -273,6 +346,8 @@ class StoryWorld:
     clues: List[StoryClue] = field(default_factory=list)
     secrets: List[StorySecret] = field(default_factory=list)
     arcs: List[StoryArc] = field(default_factory=list)
+    narrative_blocks: List[NarrativeBlock] = field(default_factory=list)
+    playable_beats: List[PlayableBeat] = field(default_factory=list)
     graph: NarrativeGraph = field(default_factory=NarrativeGraph)
     runtime_agents: Dict[str, CharacterRuntimeState] = field(default_factory=dict)
     world_state: WorldState = field(default_factory=WorldState)
@@ -335,8 +410,18 @@ class StoryProjectManager:
             story.updated_at = _now_iso()
             story_id = story.story_id
             payload = story.to_dict()
-        with open(cls.get_story_meta_path(story_id), "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2)
+        path = cls.get_story_meta_path(story_id)
+        story_dir = os.path.dirname(path)
+        fd, tmp_path = tempfile.mkstemp(prefix="world_", suffix=".json.tmp", dir=story_dir)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, path)
+        finally:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
 
     @classmethod
     def load_story(cls, story_id: str) -> Optional[Dict[str, Any]]:
@@ -344,7 +429,17 @@ class StoryProjectManager:
         if not os.path.exists(path):
             return None
         with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
+            raw = f.read()
+        try:
+            return json.loads(raw)
+        except JSONDecodeError:
+            recovered = cls._recover_story_json(raw)
+            if not recovered:
+                return None
+            backup_path = f"{path}.corrupt.{datetime.now().strftime('%Y%m%d%H%M%S')}"
+            shutil.copy2(path, backup_path)
+            cls.save_story(recovered)
+            return recovered
 
     @classmethod
     def list_stories(cls, limit: int = 50) -> List[Dict[str, Any]]:
@@ -364,3 +459,103 @@ class StoryProjectManager:
             return False
         shutil.rmtree(story_dir)
         return True
+
+    @classmethod
+    def _recover_story_json(cls, raw: str) -> Optional[Dict[str, Any]]:
+        decoder = json.JSONDecoder()
+        try:
+            data, end = decoder.raw_decode(raw)
+        except JSONDecodeError:
+            return None
+        if not isinstance(data, dict):
+            return None
+        trailing = raw[end:].strip()
+        if not trailing:
+            return data
+        return data
+
+
+class StoryGenerationJobManager:
+    ROOT_DIR = os.path.join(Config.UPLOAD_FOLDER, "story_generation_jobs")
+
+    @classmethod
+    def ensure_root_dir(cls):
+        os.makedirs(cls.ROOT_DIR, exist_ok=True)
+
+    @classmethod
+    def create_job_id(cls) -> str:
+        return f"job_{uuid.uuid4().hex[:12]}"
+
+    @classmethod
+    def get_job_dir(cls, job_id: str) -> str:
+        cls.ensure_root_dir()
+        path = os.path.join(cls.ROOT_DIR, job_id)
+        os.makedirs(path, exist_ok=True)
+        return path
+
+    @classmethod
+    def get_job_meta_path(cls, job_id: str) -> str:
+        return os.path.join(cls.get_job_dir(job_id), "job.json")
+
+    @classmethod
+    def create_job(
+        cls,
+        *,
+        job_id: str,
+        title: str = "",
+        genre: str = "",
+        source_type: str = "story",
+        world_id: str = "",
+    ) -> Dict[str, Any]:
+        payload = {
+            "job_id": job_id,
+            "status": "pending",
+            "stage": "pending",
+            "message": "任务已创建，等待开始。",
+            "progress": 0,
+            "world_id": world_id,
+            "error": "",
+            "title": title,
+            "genre": genre,
+            "source_type": source_type,
+            "created_at": _now_iso(),
+            "updated_at": _now_iso(),
+        }
+        cls.save_job(payload)
+        return payload
+
+    @classmethod
+    def save_job(cls, job: Dict[str, Any]) -> Dict[str, Any]:
+        payload = dict(job)
+        payload["updated_at"] = _now_iso()
+        path = cls.get_job_meta_path(payload["job_id"])
+        job_dir = os.path.dirname(path)
+        fd, tmp_path = tempfile.mkstemp(prefix="job_", suffix=".json.tmp", dir=job_dir)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, path)
+        finally:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        return payload
+
+    @classmethod
+    def load_job(cls, job_id: str) -> Optional[Dict[str, Any]]:
+        path = cls.get_job_meta_path(job_id)
+        if not os.path.exists(path):
+            return None
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+
+    @classmethod
+    def update_job(cls, job_id: str, **updates: Any) -> Optional[Dict[str, Any]]:
+        payload = cls.load_job(job_id)
+        if not payload:
+            return None
+        for key, value in updates.items():
+            if value is not None:
+                payload[key] = value
+        return cls.save_job(payload)

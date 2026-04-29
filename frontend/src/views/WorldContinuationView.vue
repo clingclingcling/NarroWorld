@@ -41,6 +41,20 @@
           </div>
         </div>
       </section>
+
+      <section v-if="continuation?.next_narrative_blocks?.length" class="nw-card" style="margin-top: 18px;">
+        <div class="nw-kicker">Next Playable Beats</div>
+        <div class="nw-card-title">下一篇章会如何长出来</div>
+        <div class="nw-list" style="margin-top: 16px;">
+          <div v-for="block in continuation.next_narrative_blocks" :key="block.id" class="nw-list-item">
+            <strong>{{ block.title }}</strong>
+            <p class="nw-subtle" style="margin-top: 6px;">{{ block.situation }}</p>
+            <p class="nw-subtle">冲突：{{ block.conflict }}</p>
+            <p class="nw-subtle">目标：{{ block.objective }}</p>
+            <p class="nw-subtle">风险：{{ block.risk }}</p>
+          </div>
+        </div>
+      </section>
     </div>
   </div>
 </template>

@@ -47,6 +47,14 @@
                   <pre style="white-space: pre-wrap;">{{ JSON.stringify(selectedCharacter.runtime || {}, null, 2) }}</pre>
                 </div>
                 <div class="nw-list-item">
+                  <strong>说话风格 / 风险偏好</strong>
+                  <p class="nw-subtle">{{ selectedCharacter.runtime?.speech_style || '未生成' }} / {{ selectedCharacter.runtime?.risk_profile || '未生成' }}</p>
+                </div>
+                <div class="nw-list-item">
+                  <strong>价值边界</strong>
+                  <p class="nw-subtle">{{ selectedCharacter.runtime?.value_guardrails?.join(' / ') || '暂无' }}</p>
+                </div>
+                <div class="nw-list-item">
                   <strong>证据链</strong>
                   <pre style="white-space: pre-wrap;">{{ JSON.stringify(selectedCharacter.evidence || [], null, 2) }}</pre>
                 </div>

@@ -3,8 +3,6 @@ import Home from '../views/Home.vue'
 import CreateWorldView from '../views/CreateWorldView.vue'
 import WorldOverviewView from '../views/WorldOverviewView.vue'
 import WorldPlayView from '../views/WorldPlayView.vue'
-import WorldGraphView from '../views/WorldGraphView.vue'
-import WorldCharactersView from '../views/WorldCharactersView.vue'
 import WorldDebugView from '../views/WorldDebugView.vue'
 import WorldContinuationView from '../views/WorldContinuationView.vue'
 
@@ -43,15 +41,11 @@ const routes = [
   },
   {
     path: '/world/:id/graph',
-    name: 'WorldGraph',
-    component: WorldGraphView,
-    props: true
+    redirect: to => `/world/${to.params.id}`
   },
   {
     path: '/world/:id/characters',
-    name: 'WorldCharacters',
-    component: WorldCharactersView,
-    props: true
+    redirect: to => `/world/${to.params.id}`
   },
   {
     path: '/world/:id/debug',

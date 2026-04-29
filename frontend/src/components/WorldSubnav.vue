@@ -29,9 +29,6 @@ const router = useRouter()
 const items = computed(() => ([
   { label: '总览', path: `/world/${props.worldId}` },
   { label: '剧情游玩', path: `/world/${props.worldId}/play` },
-  { label: '图谱', path: `/world/${props.worldId}/graph` },
-  { label: '角色', path: `/world/${props.worldId}/characters` },
-  { label: '续写', path: `/world/${props.worldId}/continuation` },
   { label: '调试', path: `/world/${props.worldId}/debug` }
 ]))
 </script>

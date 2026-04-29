@@ -11,11 +11,35 @@ export const ingestStory = async (formData) => {
   }), 2, 1000)
 }
 
+export const startStoryGeneration = async (formData) => {
+  return requestWithRetry(() => service({
+    url: '/api/story/generate/start',
+    method: 'post',
+    data: formData,
+    headers: {
+      'Content-Type': 'multipart/form-data'
+    }
+  }), 2, 1000)
+}
+
+export const getStoryGenerationStatus = async (jobId) => {
+  return service.get(`/api/story/generate/status/${jobId}`)
+}
+
+export const getStoryGenerationStreamUrl = (jobId) => {
+  const base = (import.meta.env.VITE_API_BASE_URL || '').replace(/\/$/, '')
+  return `${base}/api/story/generate/stream/${jobId}`
+}
+
 export const listStories = async (limit = 20) => {
   return service.get('/api/story/list', { params: { limit } })
 }
 
 export const getStory = async (storyId) => service.get(`/api/story/${storyId}`)
+
+export const deleteStory = async (storyId) => service.delete(`/api/story/${storyId}`)
+
+export const rebuildStory = async (storyId) => service.post(`/api/story/${storyId}/rebuild`)
 
 export const getWorldOverview = async (storyId) => service.get(`/api/story/${storyId}/overview`)
 
