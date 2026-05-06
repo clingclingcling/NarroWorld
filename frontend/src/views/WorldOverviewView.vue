@@ -28,7 +28,7 @@
 
       <section v-if="overview" class="nw-grid-2" style="margin-top: 18px;">
         <div class="nw-card">
-          <div class="nw-kicker">当前局面</div>
+          <div class="nw-kicker">世界入口</div>
           <div class="nw-list">
             <div class="nw-list-item">
               <strong>故事主线</strong>
@@ -37,10 +37,6 @@
             <div class="nw-list-item">
               <strong>已推进到</strong>
               <p class="nw-subtle">{{ statusLine }}</p>
-            </div>
-            <div class="nw-list-item" v-if="keyBeat">
-              <strong>最近一个关键局面</strong>
-              <p class="nw-subtle">{{ keyBeat.title }}：{{ keyBeat.objective }}</p>
             </div>
           </div>
         </div>
@@ -78,15 +74,6 @@
         </div>
       </section>
 
-      <section v-if="overview?.narrative_blocks?.length" class="nw-card" style="margin-top: 18px;">
-        <div class="nw-kicker">可玩局面</div>
-        <div class="nw-list">
-          <div v-for="block in overview.narrative_blocks.slice(0, 2)" :key="block.id" class="nw-list-item">
-            <strong>{{ block.title }}</strong>
-            <p class="nw-subtle">{{ block.summary || block.situation }}</p>
-          </div>
-        </div>
-      </section>
     </div>
   </div>
 </template>
@@ -124,8 +111,6 @@ const statusLine = computed(() => {
   const triggered = state.triggered_event_ids?.length || 0
   return `${scene} · 已触发 ${triggered} 个事件`
 })
-
-const keyBeat = computed(() => (overview.value?.narrative_blocks || [])[0] || null)
 
 const keyRelations = computed(() => {
   const graph = overview.value?.graph_preview || {}

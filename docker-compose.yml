@@ -1,14 +1,22 @@
 services:
   narraworld:
-    image: ghcr.io/666ghj/narraworld:latest
-    # 加速镜像（如拉取缓慢可替换上方地址）
-    # image: ghcr.nju.edu.cn/666ghj/narraworld:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
     container_name: narraworld
     env_file:
       - .env
+    environment:
+      FLASK_DEBUG: "false"
+      PORT: "5002"
+      WEB_CONCURRENCY: "1"
+      GUNICORN_THREADS: "8"
+      GUNICORN_TIMEOUT: "300"
+      UPLOAD_FOLDER: /app/backend/uploads
+      OASIS_SIMULATION_DATA_DIR: /app/backend/uploads/simulations
+      FRONTEND_DIST_DIR: /app/frontend/dist
     ports:
-      - "3000:3000"
-      - "5001:5001"
+      - "5002:5002"
     restart: unless-stopped
     volumes:
       - ./backend/uploads:/app/backend/uploads

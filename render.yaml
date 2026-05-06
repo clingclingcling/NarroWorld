@@ -1,0 +1,35 @@
+services:
+  - type: web
+    name: narraworld
+    env: docker
+    plan: starter
+    healthCheckPath: /health
+    disk:
+      name: narraworld-uploads
+      mountPath: /app/backend/uploads
+      sizeGB: 1
+    envVars:
+      - key: FLASK_DEBUG
+        value: "false"
+      - key: WEB_CONCURRENCY
+        value: "1"
+      - key: GUNICORN_THREADS
+        value: "8"
+      - key: GUNICORN_TIMEOUT
+        value: "300"
+      - key: UPLOAD_FOLDER
+        value: /app/backend/uploads
+      - key: OASIS_SIMULATION_DATA_DIR
+        value: /app/backend/uploads/simulations
+      - key: FRONTEND_DIST_DIR
+        value: /app/frontend/dist
+      - key: LLM_API_KEY
+        sync: false
+      - key: LLM_BASE_URL
+        sync: false
+      - key: LLM_MODEL_NAME
+        sync: false
+      - key: ZEP_API_KEY
+        sync: false
+      - key: SECRET_KEY
+        generateValue: true

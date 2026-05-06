@@ -95,3 +95,8 @@ export const getPlayStreamUrl = (storyId) => {
   const base = (import.meta.env.VITE_API_BASE_URL || '').replace(/\/$/, '')
   return `${base}/api/story/${storyId}/play/stream`
 }
+
+export const getPlayProgressStreamUrl = (storyId) => {
+  const base = (import.meta.env.VITE_API_BASE_URL || '').replace(/\/$/, '')
+  return `${base}/api/story/${storyId}/play/progress/stream`
+}

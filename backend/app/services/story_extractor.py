@@ -31,6 +31,12 @@ from .world_state import CharacterAgentRuntimeService, CharacterRegistry, Contin
 
 class StoryExtractionService:
     SUPPORTED_EXTENSIONS = {".pdf", ".md", ".markdown", ".txt"}
+    # Keep enough source beats for novella-length works without turning import
+    # into an unbounded open-world dump. The previous 16/20 hard caps caused
+    # long stories such as 《赡养人类》 to look "finished" after the opening scene.
+    MAX_SEMANTIC_EVENTS = 200
+    MAX_SCENES = 24
+    MAX_PLAYABLE_BEATS = 80
     TITLE_SUFFIXES = ["先生", "女士", "老师", "同学", "工程师", "医生", "警官", "组长", "经理"]
     GROUP_LABELS = ["警方", "公司", "网友", "启明科技", "调查组", "董事会", "媒体", "实验室"]
     COMMON_SURNAMES = "赵钱孙李周吴郑王冯陈褚卫蒋沈韩杨朱秦尤许何吕施张孔曹严华金魏陶姜戚谢邹喻柏水窦章云苏潘葛奚范彭郎鲁韦昌马苗凤花方俞任袁柳酆鲍史唐费廉岑薛雷贺倪汤滕殷罗毕郝邬安常乐于时傅皮卞齐康伍余元顾孟平黄和穆萧尹姚邵湛汪祁毛禹狄米贝明臧计伏成戴谈宋茅庞熊纪舒屈项祝董梁杜阮蓝闵席季麻强贾路娄危江童颜郭梅盛林钟徐邱骆高夏蔡田樊胡凌霍虞万支柯昝管卢莫房裘缪解应宗丁宣贲邓郁单杭洪包左石崔吉钮龚程嵇邢滑裴陆荣翁荀羊甄曲家封芮储靳焦牧山蔡田"
@@ -623,7 +629,7 @@ class StoryExtractionService:
         character_map = self._character_lookup(characters)
         previous_event_id = None
         previous_actor = ""
-        for idx, sentence in enumerate(sentences[:16], 1):
+        for idx, sentence in enumerate(sentences[:self.MAX_SEMANTIC_EVENTS], 1):
             event_shape = self._extract_event_shape(sentence, character_map, characters, previous_actor=previous_actor)
             if not event_shape:
                 continue
@@ -641,7 +647,7 @@ class StoryExtractionService:
                 "target": event_shape["target"],
                 "event_type": event_type,
                 "participants": participants,
-                "scenes": [f"scene_{min(idx, 4)}"],
+                "scenes": [f"scene_{min(((idx - 1) // 8) + 1, self.MAX_SCENES)}"],
                 "clues": [f"clue_{idx}"] if self._sentence_has_clue(sentence) else [],
                 "status": "pending",
                 "trigger_conditions": ["上一个关键节点已结束"] if previous_event_id else ["故事进入起始状态"],
@@ -650,7 +656,7 @@ class StoryExtractionService:
                 "outcomes": [sentence[:80]],
                 "caused_by": [previous_event_id] if previous_event_id else [],
                 "leads_to": [],
-                "tags": ["main"] if idx <= 5 else ["side"],
+                "tags": ["main"] if idx <= 12 else ["side"],
                 "is_key_node": is_key_node,
                 "evidence": [{
                     "quote": sentence[:180],
@@ -711,7 +717,7 @@ class StoryExtractionService:
     def _build_scenes(self, chunks: List[str], characters: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         scenes = []
         lookup = self._character_lookup(characters)
-        for idx, chunk in enumerate(chunks[:4], 1):
+        for idx, chunk in enumerate(chunks[:self.MAX_SCENES], 1):
             participants = self._match_characters_in_sentence(chunk, lookup)
             scenes.append({
                 "id": f"scene_{idx}",
@@ -793,9 +799,9 @@ class StoryExtractionService:
                 "id": "arc_main",
                 "title": "主线章节",
                 "summary": "围绕核心冲突推进的主叙事。",
-                "events": [event["id"] for event in events[:6]],
+                "events": [event["id"] for event in events[:60]],
                 "phase": "setup",
-                "key_node_event_ids": [event["id"] for event in events if event.get("is_key_node")][:4],
+                "key_node_event_ids": [event["id"] for event in events if event.get("is_key_node")][:12],
             }
         ], events)
 
@@ -1326,7 +1332,7 @@ class StoryExtractionService:
 
     def _normalize_events(self, items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         normalized = []
-        for idx, item in enumerate(items[:20], 1):
+        for idx, item in enumerate(items[:self.MAX_SEMANTIC_EVENTS], 1):
             title = StoryDataSanitizer.clean_text(item.get("title") or item.get("summary") or f"事件{idx}")
             summary = StoryDataSanitizer.clean_text(item.get("summary", ""))
             if not StoryDataSanitizer.is_valid_event_text(title):
@@ -1369,7 +1375,7 @@ class StoryExtractionService:
                 "items": item.get("items", [])[:6],
                 "evidence": item.get("evidence", [])[:3],
             }
-            for idx, item in enumerate(items[:12], 1)
+            for idx, item in enumerate(items[:self.MAX_SCENES], 1)
         ]
 
     def _normalize_rules(self, items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -1437,7 +1443,7 @@ class StoryExtractionService:
         valid_scene_ids = {item["id"] for item in scenes}
         valid_clue_ids = {item["id"] for item in clues}
         normalized = []
-        for idx, item in enumerate(items[:10], 1):
+        for idx, item in enumerate(items[:self.MAX_PLAYABLE_BEATS], 1):
             event_ids = [event_id for event_id in item.get("event_ids", []) if event_id in valid_event_ids]
             if not event_ids:
                 continue
@@ -1488,7 +1494,7 @@ class StoryExtractionService:
         }
         scene_map = {item["id"]: item for item in scenes}
         normalized = []
-        for idx, item in enumerate(items[:16], 1):
+        for idx, item in enumerate(items[:self.MAX_PLAYABLE_BEATS], 1):
             source_event_ids = [event_id for event_id in item.get("source_event_ids", []) if event_id in valid_event_ids]
             if not source_event_ids:
                 continue

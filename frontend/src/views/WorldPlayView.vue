@@ -8,21 +8,52 @@
         <div class="nw-card" style="display: flex; gap: 12px; flex-wrap: wrap; align-items: center;">
           <span class="nw-pill">你是 {{ protagonistName }}</span>
           <span class="nw-pill">{{ sceneMetaLine }}</span>
+          <span class="nw-pill" :class="{ 'nw-pill-loading': isPlayLoading }">{{ progressLabel }}</span>
         </div>
       </section>
 
-      <section class="nw-play-layout" style="margin-top: 18px; grid-template-columns: minmax(0, 1fr) 320px;">
-        <main class="nw-card strong nw-play-stage nw-play-focus">
-          <section class="nw-card nw-turn-context">
-            <div class="nw-kicker">当前局面</div>
-            <p class="nw-turn-summary">{{ currentTurnSummary }}</p>
-            <p class="nw-subtle" style="margin-top: 12px;">
-              当前目标：{{ currentGoal }}
-            </p>
-          </section>
+      <section class="nw-card strong nw-play-brief">
+        <div class="nw-kicker">可玩局面</div>
+        <div class="nw-play-brief-head">
+          <div>
+            <div class="nw-card-title">{{ currentBeatTitle }}</div>
+            <p class="nw-play-situation">{{ currentTurnSummary }}</p>
+          </div>
+          <div class="nw-play-brief-meta">
+            <span>{{ currentPhaseLabel }}</span>
+            <span>{{ sceneMetaLine }}</span>
+          </div>
+        </div>
 
+        <div class="nw-play-context-grid">
+          <div class="nw-context-piece">
+            <strong>当前目标</strong>
+            <p>{{ currentGoal }}</p>
+          </div>
+          <div class="nw-context-piece">
+            <strong>风险</strong>
+            <p>{{ currentRisk }}</p>
+          </div>
+          <div class="nw-context-piece wide">
+            <strong>背景补充</strong>
+            <p>{{ playableBackground }}</p>
+          </div>
+        </div>
+      </section>
+
+      <section class="nw-play-layout nw-play-layout-roomy" style="margin-top: 18px;">
+        <main class="nw-card strong nw-play-stage nw-play-focus">
           <section class="nw-card strong nw-feed-stage">
             <div class="nw-kicker">剧情正在发生</div>
+            <div v-if="showPlayProgress" class="nw-play-progress">
+              <div class="nw-play-progress-top">
+                <span>{{ progressLabel }}</span>
+                <span>{{ progressPercent }}%</span>
+              </div>
+              <div class="nw-play-progress-track">
+                <div class="nw-play-progress-fill" :style="{ width: `${progressPercent}%` }"></div>
+              </div>
+            </div>
             <div class="nw-chat nw-feed-stream">
               <div
                 v-for="message in feedMessages"
@@ -74,7 +105,7 @@
             />
             <div class="nw-actions" style="margin-top: 12px;">
               <button class="nw-btn primary" :disabled="submitting" @click="submitInput">说出口</button>
-              <button class="nw-btn" :disabled="submitting" @click="nudge">下一步</button>
+              <button v-if="canManualAdvance" class="nw-btn" :disabled="submitting" @click="nudge">继续推进</button>
             </div>
           </section>
         </main>
@@ -82,7 +113,7 @@
         <aside class="nw-play-side nw-play-side-right">
           <div class="nw-card nw-side-card">
             <div class="nw-kicker">此刻最相关的人</div>
-            <div v-if="relatedCharacters.length" class="nw-list">
+            <div v-if="relatedCharacters.length" class="nw-list nw-scroll-list">
               <div v-for="person in relatedCharacters" :key="person.id" class="nw-list-item nw-compact-item">
                 <div class="nw-stance-row">
                   <strong>{{ person.name }}</strong>
@@ -106,7 +137,7 @@
 
 <script setup>
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
-import { useRoute } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import NarraTopBar from '../components/NarraTopBar.vue'
 import WorldSubnav from '../components/WorldSubnav.vue'
 import {
@@ -121,12 +152,14 @@ import {
 } from '../api/story'
 
 const route = useRoute()
+const router = useRouter()
 const worldId = route.params.id
 const overview = ref(null)
 const characterRoster = ref([])
 const playState = ref(null)
 const worldState = ref(null)
 const director = ref(null)
+const playProgress = ref(null)
 const playerInput = ref('')
 const submitting = ref(false)
 let eventSource = null
@@ -137,7 +170,6 @@ const NOISY_NAMES = new Set(['消息', '一秒', '公司', '警方', '监控', '
 const FEED_TYPES = new Set(['system', 'character', 'player', 'feedback', 'clue', 'scene'])
 
 const currentTurn = computed(() => playState.value?.current_turn || null)
-const latestFeedback = computed(() => playState.value?.latest_feedback || currentTurn.value?.latest_feedback || null)
 
 const protagonistName = computed(() => {
   return playState.value?.protagonist_name || worldState.value?.player_state?.protagonist_name || '你'
@@ -145,6 +177,25 @@ const protagonistName = computed(() => {
 
 const currentGoal = computed(() => {
   return currentTurn.value?.objective || '先判断谁值得逼近，谁值得隐瞒。'
+})
+
+const currentRisk = computed(() => {
+  return currentTurn.value?.risk || activeNarrativeBlock.value?.risk || '你说得太快会暴露判断，沉默太久也会让别人替你定调。'
+})
+
+const currentBeatTitle = computed(() => {
+  return currentTurn.value?.headline || activeNarrativeBlock.value?.title || overview.value?.title || '剧情正在展开'
+})
+
+const currentPhaseLabel = computed(() => {
+  const phase = worldState.value?.phase || currentTurn.value?.state_summary?.phase || 'setup'
+  const labels = {
+    setup: '开局',
+    confrontation: '对峙',
+    climax: '高压',
+    resolution: '收束'
+  }
+  return labels[phase] || phase
 })
 
 const sceneMetaLine = computed(() => {
@@ -162,9 +213,6 @@ const currentTurnSummary = computed(() => {
 })
 
 const visibleActionOptions = computed(() => {
-  if (latestFeedback.value && !playState.value?.current_decision) {
-    return []
-  }
   const options = playState.value?.current_decision?.options || currentTurn.value?.actions || []
   return options
     .slice(0, 5)
@@ -174,14 +222,53 @@ const visibleActionOptions = computed(() => {
     }))
 })
 
+const canManualAdvance = computed(() => {
+  if (visibleActionOptions.value.length) return false
+  if (playState.value?.pending_messages?.length) return false
+  return true
+})
+
+const activeProgress = computed(() => playProgress.value || playState.value?.runtime_status || {})
+
+const progressPercent = computed(() => {
+  const value = Number(activeProgress.value?.progress)
+  if (Number.isFinite(value)) return Math.max(0, Math.min(100, Math.round(value)))
+  return submitting.value ? 30 : 100
+})
+
+const isPlayLoading = computed(() => {
+  const status = activeProgress.value?.status
+  return submitting.value || activeProgress.value?.loading || status === 'running' || status === 'streaming'
+})
+
+const progressLabel = computed(() => {
+  if (activeProgress.value?.message) return activeProgress.value.message
+  if (submitting.value) return '正在处理你的动作…'
+  return '剧情已就绪'
+})
+
+const showPlayProgress = computed(() => {
+  return isPlayLoading.value || activeProgress.value?.status === 'failed'
+})
+
 const feedMessages = computed(() => {
   return mergeFeed([], playState.value?.feed || [])
 })
 
 const relatedCharacters = computed(() => {
-  const present = currentTurn.value?.present_characters || []
+  const present = [
+    ...(currentTurn.value?.present_characters || []),
+    ...(currentTurn.value?.context_characters || [])
+  ]
+  const seen = new Set()
   return present
     .filter(person => isDisplayableCharacter(person.name))
+    .filter(person => {
+      const key = person.id || person.name
+      if (seen.has(key)) return false
+      seen.add(key)
+      return true
+    })
     .slice(0, 4)
     .map(person => {
       const full = characterRoster.value.find(item => item.id === person.id) || {}
@@ -189,7 +276,7 @@ const relatedCharacters = computed(() => {
       return {
         id: person.id,
         name: person.name,
-        summary: person.summary,
+        summary: compactCharacterSummary(full, person),
         stance: stance.label,
         stanceClass: stance.className
       }
@@ -205,6 +292,30 @@ const supplementalHint = computed(() => {
   }
   if (currentGoal.value) return currentGoal.value
   return '这轮真正重要的，不是说出口的话，而是谁先把自己的站位露了出来。'
+})
+
+const activeNarrativeBlock = computed(() => {
+  const blocks = overview.value?.narrative_blocks || []
+  if (!blocks.length) return null
+  const blockId = currentTurn.value?.block_id
+  if (blockId) {
+    const matched = blocks.find(block => block.id === blockId)
+    if (matched) return matched
+  }
+  return blocks[0]
+})
+
+const playableBackground = computed(() => {
+  const block = activeNarrativeBlock.value || {}
+  const candidates = [
+    block.player_implication,
+    block.conflict,
+    block.summary,
+    block.situation,
+    overview.value?.main_storyline,
+    overview.value?.summary
+  ]
+  return candidates.find(item => String(item || '').trim()) || '你进入的不是一段旁观剧情，而是一个已经开始互相试探的现场。'
 })
 
 const syncOverview = async () => {
@@ -229,6 +340,7 @@ const applySnapshot = async (payload) => {
   if (payload.play_state) mergePlayState(payload.play_state)
   if (payload.world_state) worldState.value = payload.world_state
   if (payload.director) director.value = payload.director
+  if (payload.progress) playProgress.value = payload.progress
 }
 
 const normalizeFeedMessage = (message) => {
@@ -307,6 +419,10 @@ const connectStream = () => {
     }
   })
 
+  eventSource.addEventListener('progress', async (event) => {
+    playProgress.value = JSON.parse(event.data)
+  })
+
   eventSource.onerror = async () => {
     if (eventSource) {
       eventSource.close()
@@ -322,10 +438,12 @@ const connectStream = () => {
 const submitInput = async () => {
   if (!playerInput.value.trim() || submitting.value) return
   submitting.value = true
+  setLocalProgress('running', 'resolving_input', '正在理解你的输入并生成剧情反馈。', 24)
   try {
     const res = await sendPlayInput(worldId, { input: playerInput.value })
     if (res.play_state) mergePlayState(res.play_state)
     if (res.world_state) worldState.value = res.world_state
+    if (res.progress) playProgress.value = res.progress
     playerInput.value = ''
   } finally {
     submitting.value = false
@@ -334,11 +452,18 @@ const submitInput = async () => {
 
 const submitChoice = async (optionId) => {
   if (submitting.value) return
+  const option = visibleActionOptions.value.find(item => item.id === optionId)
+  if (option?.action_type === 'open_continuation') {
+    router.push(`/world/${worldId}/continuation`)
+    return
+  }
   submitting.value = true
+  setLocalProgress('running', 'resolving_choice', '正在根据你的选择计算反馈和下一步。', 24)
   try {
     const res = await sendPlayChoice(worldId, { option_id: optionId })
     if (res.play_state) mergePlayState(res.play_state)
     if (res.world_state) worldState.value = res.world_state
+    if (res.progress) playProgress.value = res.progress
   } finally {
     submitting.value = false
   }
@@ -347,13 +472,26 @@ const submitChoice = async (optionId) => {
 const nudge = async () => {
   if (submitting.value) return
   submitting.value = true
+  setLocalProgress('running', 'advancing_story', '正在推进下一拍剧情。', 28)
   try {
     const res = await tickPlayState(worldId)
     mergePlayState(res.data)
+    if (res.progress) playProgress.value = res.progress
     director.value = res.data?.director || director.value
     await syncOverview()
   } finally {
     submitting.value = false
+  }
+}
+
+const setLocalProgress = (status, stage, message, progress) => {
+  playProgress.value = {
+    status,
+    stage,
+    message,
+    progress,
+    loading: status === 'running',
+    updated_ts: Date.now() / 1000
   }
 }
 
@@ -365,11 +503,16 @@ const actionHint = (option) => {
 }
 
 const messageLabel = (message) => {
+  const kind = String(message?.metadata?.kind || '').trim().toLowerCase()
   if (message.type === 'character') return message.author || '角色'
   if (message.type === 'player') return '你'
   if (message.type === 'feedback') return '反馈'
   if (message.type === 'scene') return '场景'
   if (message.type === 'clue') return '线索'
+  if (kind === 'memory' || kind === 'memory_flash') return '记忆'
+  if (kind === 'background' || kind === 'context_note') return '背景'
+  if (kind === 'transition' || kind === 'compressed_narration') return '过场'
+  if (kind === 'world_intro') return '系统'
   return '系统'
 }
 
@@ -399,6 +542,22 @@ const deriveStance = (full, fallback) => {
     return { label: '观望', className: 'neutral' }
   }
   return { label: '未知', className: 'unknown' }
+}
+
+const compactCharacterSummary = (full, fallback) => {
+  const parts = [
+    fallback?.summary,
+    full?.summary,
+    full?.motivation ? `动机：${full.motivation}` : '',
+    full?.persona ? `人设：${full.persona}` : '',
+    Array.isArray(full?.traits) && full.traits.length ? `特质：${full.traits.slice(0, 4).join('、')}` : '',
+    Array.isArray(full?.goals) && full.goals.length ? `目标：${full.goals.slice(0, 3).join('、')}` : '',
+    Array.isArray(full?.knowledge_scope) && full.knowledge_scope.length ? `已知：${full.knowledge_scope.slice(0, 3).join('、')}` : ''
+  ]
+    .map(item => String(item || '').trim())
+    .filter(Boolean)
+
+  return Array.from(new Set(parts)).join('\n')
 }
 
 onMounted(async () => {

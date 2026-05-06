@@ -667,11 +667,13 @@ class PlayEventQueue:
             previous = existing.get(event_id, {})
             priority, reason, debug_reason = cls._priority_payload(story_data, world_state, event)
             status = cls._normalize_status(previous.get("status", "pending"))
-            if event_id == current_event_id:
+            if status in {"skipped", "compressed", "consumed"}:
+                status = status
+            elif event_id == current_event_id:
                 status = "active"
             elif event_id in world_state.triggered_event_ids:
                 status = "consumed"
-            elif status not in {"skipped", "compressed"}:
+            else:
                 status = "pending"
 
             queue.append({
@@ -823,8 +825,13 @@ class PlayerInteractionService:
 
         registry = CharacterRegistry.ensure(story_data)
         alias_map = registry.get("alias_map") or {}
+        protagonist_id = (story_data.get("play_state") or {}).get("protagonist_id") or (
+            (story_data.get("world_state") or {}).get("player_state") or {}
+        ).get("protagonist_id")
         for alias, character_id in alias_map.items():
             if alias and alias in lowered:
+                if protagonist_id and character_id == protagonist_id:
+                    continue
                 target = CharacterRegistry.get_character(story_data, character_id, require_playable=True)
                 if target:
                     return {"intent": "intervene_character", "targets": [character_id]}

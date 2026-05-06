@@ -121,6 +121,93 @@ def _sse_event(data, event: str = "message", event_id: str = "") -> str:
     return "\n".join(chunks) + "\n\n"
 
 
+def _play_progress_payload(story: dict, play_state: dict | None = None, prefer_runtime: bool = True) -> dict:
+    play_state = play_state or story.get("play_state", {}) or {}
+    runtime = play_state.get("runtime_status") or {}
+    now = time.time()
+    pending_messages = len(play_state.get("pending_messages") or [])
+    feed_count = len(play_state.get("feed") or [])
+    queue = play_state.get("event_queue") or []
+    pending_events = sum(1 for item in queue if item.get("status") == "pending")
+    active_event = next((item.get("event_id") for item in queue if item.get("status") == "active"), None)
+    decision_required = bool(play_state.get("current_decision"))
+
+    runtime_updated = float(runtime.get("updated_ts") or 0)
+    if prefer_runtime and runtime.get("status") in {"running", "failed"} and now - runtime_updated < 180:
+        status = runtime.get("status")
+        stage = runtime.get("stage") or "running"
+        message = runtime.get("message") or "剧情正在生成中。"
+        progress = int(runtime.get("progress") or 35)
+        loading = status == "running"
+    elif pending_messages:
+        status = "streaming"
+        stage = "releasing_messages"
+        message = f"正在释放剧情消息，还有 {pending_messages} 条待显示。"
+        progress = 75
+        loading = True
+    elif decision_required:
+        status = "waiting_player"
+        stage = "waiting_choice"
+        message = "等待你选择下一步动作。"
+        progress = 100
+        loading = False
+    elif play_state.get("chapter_complete"):
+        status = "complete"
+        stage = "chapter_complete"
+        message = "当前导入的可玩节拍已经推进到末尾。"
+        progress = 100
+        loading = False
+    elif pending_events:
+        status = "ready"
+        stage = "ready"
+        message = "剧情已就绪，可以继续推进。"
+        progress = 100
+        loading = False
+    else:
+        status = "idle"
+        stage = "idle"
+        message = "剧情流当前没有待处理任务。"
+        progress = 100
+        loading = False
+
+    return {
+        "world_id": story.get("story_id", ""),
+        "status": status,
+        "stage": stage,
+        "message": message,
+        "progress": max(0, min(100, progress)),
+        "loading": loading,
+        "updated_ts": runtime_updated or now,
+        "cursor": feed_count,
+        "pending_messages": pending_messages,
+        "pending_events": pending_events,
+        "active_event_id": active_event or (story.get("world_state", {}) or {}).get("current_event_id"),
+        "decision_required": decision_required,
+    }
+
+
+def _set_play_progress(story: dict, status: str, stage: str, message: str, progress: int) -> dict:
+    play_state = story.setdefault("play_state", {})
+    payload = {
+        "world_id": story.get("story_id", ""),
+        "status": status,
+        "stage": stage,
+        "message": message,
+        "progress": max(0, min(100, int(progress))),
+        "loading": status == "running",
+        "updated_ts": time.time(),
+    }
+    play_state["runtime_status"] = payload
+    return payload
+
+
+def _finish_play_progress(story: dict, play_state: dict | None = None) -> dict:
+    payload = _play_progress_payload(story, play_state=play_state, prefer_runtime=False)
+    payload["updated_ts"] = time.time()
+    story.setdefault("play_state", {})["runtime_status"] = payload
+    return payload
+
+
 def _update_generation_job(job_id: str, **updates):
     return StoryGenerationJobManager.update_job(job_id, **updates)
 
@@ -421,7 +508,11 @@ def get_story_debug(story_id: str):
     story, error = _load_world_or_404(story_id)
     if error:
         return error
+    before_play_state = json.dumps(story.get("play_state", {}), ensure_ascii=False, sort_keys=True)
     play_state = ChatDrivenPlayRuntimeService.ensure_play_state(story)
+    after_play_state = json.dumps(story.get("play_state", {}), ensure_ascii=False, sort_keys=True)
+    if before_play_state != after_play_state:
+        _persist_story(story)
     protagonist = ProtagonistResolver.resolve(story)
     return jsonify({
         "success": True,
@@ -506,7 +597,12 @@ def get_play_state(story_id: str):
     story, error = _load_world_or_404(story_id)
     if error:
         return error
+    before_play_state = json.dumps(story.get("play_state", {}), ensure_ascii=False, sort_keys=True)
     play_state = ChatDrivenPlayRuntimeService.ensure_play_state(story)
+    play_state = ChatDrivenPlayRuntimeService.release_due_feed_messages(story)
+    after_play_state = json.dumps(story.get("play_state", {}), ensure_ascii=False, sort_keys=True)
+    if before_play_state != after_play_state:
+        _persist_story(story)
     return jsonify({"success": True, "data": play_state})
 
 
@@ -539,8 +635,10 @@ def stream_play(story_id: str):
         state_signature = ""
         deadline = time.time() + 25
         initial_snapshot = ChatDrivenPlayRuntimeService.snapshot(story)
-        cursor = max(cursor, initial_snapshot.get("cursor", 0))
         yield _sse_event(initial_snapshot, event="init")
+        initial_progress = _play_progress_payload(story, initial_snapshot.get("play_state", {}))
+        yield _sse_event(initial_progress, event="progress")
+        progress_signature = json.dumps(initial_progress, ensure_ascii=False, sort_keys=True)
 
         while time.time() < deadline:
             latest_story = StoryProjectManager.load_story(story_id)
@@ -548,12 +646,15 @@ def stream_play(story_id: str):
                 yield _sse_event({"error": "世界已不可用"}, event="error")
                 break
 
-            play_state = ChatDrivenPlayRuntimeService.tick(latest_story)
-            latest_story["continuation"] = ContinuationEngine.generate(
-                latest_story,
-                WorldState(**latest_story.get("world_state", {})),
-            )
-            _persist_story(latest_story)
+            before_play_state = latest_story.get("play_state") or {}
+            before_pending = len(before_play_state.get("pending_messages") or [])
+            before_feed = len(before_play_state.get("feed") or [])
+            play_state = ChatDrivenPlayRuntimeService.release_due_feed_messages(latest_story)
+            if (
+                len(play_state.get("pending_messages") or []) != before_pending
+                or len(play_state.get("feed") or []) != before_feed
+            ):
+                _persist_story(latest_story)
 
             feed = play_state.get("feed", [])
             if cursor > len(feed):
@@ -583,6 +684,44 @@ def stream_play(story_id: str):
             else:
                 yield ": keep-alive\n\n"
 
+            progress_payload = _play_progress_payload(latest_story, play_state)
+            new_progress_signature = json.dumps(progress_payload, ensure_ascii=False, sort_keys=True)
+            if new_progress_signature != progress_signature:
+                progress_signature = new_progress_signature
+                yield _sse_event(progress_payload, event="progress")
+
+            time.sleep(1.0)
+
+    return Response(generate(), mimetype="text/event-stream", headers={
+        "Cache-Control": "no-cache",
+        "X-Accel-Buffering": "no",
+        "Connection": "keep-alive",
+    })
+
+
+@story_bp.route("/<story_id>/play/progress/stream", methods=["GET"])
+def stream_play_progress(story_id: str):
+    story, error = _load_world_or_404(story_id)
+    if error:
+        return error
+
+    @stream_with_context
+    def generate():
+        last_signature = ""
+        deadline = time.time() + 25
+        while time.time() < deadline:
+            latest_story = StoryProjectManager.load_story(story_id)
+            if not latest_story:
+                yield _sse_event({"status": "failed", "error": "世界已不可用"}, event="progress")
+                break
+            play_state = ChatDrivenPlayRuntimeService.ensure_play_state(latest_story)
+            payload = _play_progress_payload(latest_story, play_state)
+            signature = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+            if signature != last_signature:
+                last_signature = signature
+                yield _sse_event(payload, event="progress")
+            else:
+                yield ": keep-alive\n\n"
             time.sleep(1.0)
 
     return Response(generate(), mimetype="text/event-stream", headers={
@@ -597,10 +736,20 @@ def tick_play(story_id: str):
     story, error = _load_world_or_404(story_id)
     if error:
         return error
-    play_state = ChatDrivenPlayRuntimeService.tick(story)
-    story["continuation"] = ContinuationEngine.generate(story, WorldState(**story.get("world_state", {})))
-    _persist_story(story)
-    return jsonify({"success": True, "data": play_state})
+    try:
+        _set_play_progress(story, "running", "advancing_story", "正在推进下一拍剧情。", 28)
+        _persist_story(story)
+        play_state = ChatDrivenPlayRuntimeService.tick(story, trigger="manual")
+        _set_play_progress(story, "running", "updating_context", "正在同步世界状态与后续上下文。", 82)
+        story["continuation"] = ContinuationEngine.generate(story, WorldState(**story.get("world_state", {})))
+        _finish_play_progress(story, play_state)
+        _persist_story(story)
+        return jsonify({"success": True, "data": play_state, "progress": story.get("play_state", {}).get("runtime_status", {})})
+    except Exception as e:
+        logger.error(f"剧情推进失败: {e}")
+        _set_play_progress(story, "failed", "advance_failed", f"剧情推进失败：{e}", 100)
+        _persist_story(story)
+        return jsonify({"success": False, "error": str(e), "traceback": traceback.format_exc()}), 500
 
 
 @story_bp.route("/<story_id>/play/input", methods=["POST"])
@@ -609,16 +758,27 @@ def play_input(story_id: str):
     if error:
         return error
     payload = request.get_json() or {}
-    result = ChatDrivenPlayRuntimeService.submit_player_input(story, payload.get("input", ""))
-    story["continuation"] = ContinuationEngine.generate(story, WorldState(**story.get("world_state", {})))
-    _persist_story(story)
-    return jsonify({
-        "success": True,
-        "data": result,
-        "play_state": story.get("play_state", {}),
-        "world_state": story.get("world_state", {}),
-        "continuation": story.get("continuation", {}),
-    })
+    try:
+        _set_play_progress(story, "running", "resolving_input", "正在理解你的输入并生成剧情反馈。", 24)
+        _persist_story(story)
+        result = ChatDrivenPlayRuntimeService.submit_player_input(story, payload.get("input", ""))
+        _set_play_progress(story, "running", "updating_context", "正在同步关系、线索和后续节拍。", 78)
+        story["continuation"] = ContinuationEngine.generate(story, WorldState(**story.get("world_state", {})))
+        _finish_play_progress(story, story.get("play_state", {}))
+        _persist_story(story)
+        return jsonify({
+            "success": True,
+            "data": result,
+            "play_state": story.get("play_state", {}),
+            "world_state": story.get("world_state", {}),
+            "continuation": story.get("continuation", {}),
+            "progress": story.get("play_state", {}).get("runtime_status", {}),
+        })
+    except Exception as e:
+        logger.error(f"玩家输入处理失败: {e}")
+        _set_play_progress(story, "failed", "input_failed", f"输入处理失败：{e}", 100)
+        _persist_story(story)
+        return jsonify({"success": False, "error": str(e), "traceback": traceback.format_exc()}), 500
 
 
 @story_bp.route("/<story_id>/play/choice", methods=["POST"])
@@ -627,16 +787,27 @@ def play_choice(story_id: str):
     if error:
         return error
     payload = request.get_json() or {}
-    result = ChatDrivenPlayRuntimeService.submit_choice(story, payload.get("option_id", ""))
-    story["continuation"] = ContinuationEngine.generate(story, WorldState(**story.get("world_state", {})))
-    _persist_story(story)
-    return jsonify({
-        "success": True,
-        "data": result,
-        "play_state": story.get("play_state", {}),
-        "world_state": story.get("world_state", {}),
-        "continuation": story.get("continuation", {}),
-    })
+    try:
+        _set_play_progress(story, "running", "resolving_choice", "正在根据你的选择计算反馈和下一步。", 24)
+        _persist_story(story)
+        result = ChatDrivenPlayRuntimeService.submit_choice(story, payload.get("option_id", ""))
+        _set_play_progress(story, "running", "updating_context", "正在同步选择影响到世界状态。", 78)
+        story["continuation"] = ContinuationEngine.generate(story, WorldState(**story.get("world_state", {})))
+        _finish_play_progress(story, story.get("play_state", {}))
+        _persist_story(story)
+        return jsonify({
+            "success": True,
+            "data": result,
+            "play_state": story.get("play_state", {}),
+            "world_state": story.get("world_state", {}),
+            "continuation": story.get("continuation", {}),
+            "progress": story.get("play_state", {}).get("runtime_status", {}),
+        })
+    except Exception as e:
+        logger.error(f"玩家选项处理失败: {e}")
+        _set_play_progress(story, "failed", "choice_failed", f"选项处理失败：{e}", 100)
+        _persist_story(story)
+        return jsonify({"success": False, "error": str(e), "traceback": traceback.format_exc()}), 500
 
 
 @story_bp.route("/<story_id>/continuation", methods=["GET", "POST"])

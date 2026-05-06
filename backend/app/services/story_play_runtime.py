@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Optional
 
 from ..models.story import DecisionOption, PlotNode
 from .story_graph import NarrativeGraphService
-from .world_state import CharacterRegistry, NarrativePlanner, PlayEventQueue, PlayerInteractionService, WorldState, WorldStateEngine
+from .world_state import CharacterRegistry, ContinuationEngine, NarrativePlanner, PlayEventQueue, PlayerInteractionService, WorldState, WorldStateEngine
 from ..utils.llm_client import LLMClient
 from ..utils.logger import get_logger
 
@@ -431,7 +431,7 @@ class NarrativeCompressor:
             " -> ".join(_event_debug_label(item["event"]) for item in visible_items),
         )
         return {
-            "messages": cls._compressed_messages(compressed_turn),
+            "messages": cls._compressed_messages(compressed_turn, story_data),
             "turn": compressed_turn,
             "event_ids": compressed_ids,
         }
@@ -511,7 +511,10 @@ class NarrativeCompressor:
     def _summary_text(cls, batch: List[Dict[str, Any]], protagonist: Optional[Dict[str, Any]], mode: str) -> str:
         snippets = []
         for item in batch:
-            text = NarrativeEventAdapter._clean_text(item["turn"].get("situation", ""))
+            text = NarrativeEventAdapter._clean_visible_system_text(
+                item["turn"].get("situation", ""),
+                NarrativeEventAdapter._system_message_kind(item["turn"], default="background"),
+            )
             if text and text not in snippets:
                 snippets.append(NarrativeEventAdapter._truncate(text, 56))
         joined = " ".join(snippets[:2])
@@ -523,15 +526,20 @@ class NarrativeCompressor:
         return "你没有额外出手，但局面已经往前滑了一段。最要紧的不是谁说了什么，而是谁在这几步里悄悄换了位置。"
 
     @classmethod
-    def _compressed_messages(cls, turn: Dict[str, Any]) -> List[Dict[str, Any]]:
+    def _compressed_messages(cls, turn: Dict[str, Any], story_data: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
         if not turn:
             return []
         messages = []
-        if turn.get("scene_label") and turn.get("compression_mode") == "transition":
+        scene_label = NarrativeEventAdapter._clean_text(turn.get("scene_label", ""))
+        if (
+            scene_label
+            and turn.get("compression_mode") == "transition"
+            and not scene_label.startswith("过场")
+        ):
             messages.append(
                 NarrativeEventAdapter._message(
                     "scene",
-                    f"过场：{turn['scene_label']}",
+                    f"过场：{scene_label}",
                     metadata={"kind": "scene_transition", "layer": "system"},
                 )
             )
@@ -539,7 +547,7 @@ class NarrativeCompressor:
             NarrativeEventAdapter._message(
                 "system",
                 turn.get("situation", ""),
-                metadata={"kind": "compressed_narration", "layer": "system"},
+                metadata={"kind": NarrativeEventAdapter._system_message_kind(turn, default="background"), "layer": "system"},
             )
         )
         clue_id = turn.get("revealed_clue_id") or ((turn.get("revealed_clue_ids") or [None])[0])
@@ -552,7 +560,7 @@ class NarrativeCompressor:
                     metadata={"kind": "clue_unlock", "layer": "system"},
                 )
             )
-        return [item for item in messages if NarrativeEventAdapter._clean_text(item.get("text", ""))]
+        return NarrativeEventAdapter.sanitize_visible_messages(messages, story_data)
 
 
 class NarrativeEventAdapter:
@@ -612,14 +620,19 @@ class NarrativeEventAdapter:
         story_data: Dict[str, Any],
         event: Dict[str, Any],
         turn: Optional[Dict[str, Any]] = None,
+        previous_turn: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
         protagonist = ProtagonistResolver.resolve(story_data)
         turn = turn or cls.build_turn(story_data, event, protagonist)
         if NarrativeCompressor.should_compress(turn):
-            return NarrativeCompressor._compressed_messages(turn)
-        previous_turn = ((story_data.get("play_state") or {}).get("current_turn") or {})
+            return NarrativeCompressor._compressed_messages(turn, story_data)
+        previous_turn = previous_turn if previous_turn is not None else ((story_data.get("play_state") or {}).get("current_turn") or {})
         messages = []
-        if turn.get("scene_label") and turn.get("scene_label") != previous_turn.get("scene_label"):
+        if (
+            turn.get("scene_label")
+            and turn.get("scene_label") != previous_turn.get("scene_label")
+            and turn.get("should_render_full_turn", True)
+        ):
             messages.append(
                 cls._message(
                     "scene",
@@ -632,7 +645,7 @@ class NarrativeEventAdapter:
                 cls._message(
                     "system",
                     turn["situation"],
-                    metadata={"event_id": event["id"], "kind": "narration", "layer": "system"},
+                    metadata={"event_id": event["id"], "kind": cls._system_message_kind(turn), "layer": "system"},
                 )
             )
         if turn.get("supplemental_hint") and turn.get("supplemental_hint") != previous_turn.get("supplemental_hint"):
@@ -641,7 +654,7 @@ class NarrativeEventAdapter:
                     "system",
                     turn["supplemental_hint"],
                     delay_ms=420,
-                    metadata={"event_id": event["id"], "kind": "context_note", "layer": "system"},
+                    metadata={"event_id": event["id"], "kind": "background", "layer": "system"},
                 )
             )
         if cls._should_emit_character_dialogues(turn):
@@ -656,7 +669,7 @@ class NarrativeEventAdapter:
                         metadata={"event_id": event["id"], "kind": "character_update", "layer": "character"},
                     )
                 )
-        return messages
+        return cls.sanitize_visible_messages(messages, story_data)
 
     @classmethod
     def _should_emit_character_dialogues(cls, turn: Dict[str, Any]) -> bool:
@@ -693,10 +706,28 @@ class NarrativeEventAdapter:
     def sanitize_visible_messages(cls, messages: List[Dict[str, Any]], story_data: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
         cleaned = []
         seen = set()
+        last_scene_text = ""
+        generic_system_count = 0
+        transition_scene_seen = False
         for message in messages:
             normalized = cls._sanitize_message(message, story_data)
             if not normalized:
                 continue
+            msg_type = normalized.get("type")
+            text = normalized.get("text", "")
+            if msg_type == "scene":
+                kind = (normalized.get("metadata") or {}).get("kind")
+                if kind == "scene_transition":
+                    if transition_scene_seen:
+                        continue
+                    transition_scene_seen = True
+                if text == last_scene_text:
+                    continue
+                last_scene_text = text
+            if msg_type == "system" and cls._is_generic_repeated_system_text(text):
+                generic_system_count += 1
+                if generic_system_count > 1:
+                    continue
             key = (
                 normalized.get("type"),
                 normalized.get("author"),
@@ -786,13 +817,15 @@ class NarrativeEventAdapter:
             story_data,
             (beat or {}).get("scene_id") or (event.get("scenes") or [world_state.get("current_scene_id")])[0],
         )
+        explicit_character_ids = list((beat or {}).get("present_character_ids", [])) + list(event.get("participants", []))
         participant_candidates = cls._speaker_candidates_from_ids(story_data, protagonist, (beat or {}).get("present_character_ids", []))
-        if not participant_candidates:
+        if not participant_candidates and cls._allow_speaker_fallback(story_data, protagonist, event, beat, explicit_character_ids):
             participant_candidates = cls._speaker_candidates(story_data, protagonist, scene, event)
         speakers = SpeakingEligibility.select_for_turn(story_data, protagonist, event, beat, scene, participant_candidates, limit=1)
         dialogues = cls._build_dialogues(story_data, protagonist, event, speakers, beat=beat)
         stage_characters = cls._stage_characters_from_speakers(story_data, protagonist, speakers, dialogues)
-        should_render_full_turn = (beat or {}).get("should_render_full_turn", True)
+        context_only = cls._is_context_only_event(story_data, protagonist, event, beat, stage_characters, explicit_character_ids)
+        should_render_full_turn = (beat or {}).get("should_render_full_turn", True) and not context_only
         actions = (
             [asdict(option) for option in ActionDirector.build_actions(story_data, event, protagonist, stage_characters, beat=beat, block=block, scene=scene)]
             if should_render_full_turn else []
@@ -800,11 +833,23 @@ class NarrativeEventAdapter:
         clue_hint = cls._event_clue_hint(story_data, event)
         objective = (beat or {}).get("player_objective") or (block or {}).get("objective") or cls._turn_objective(event, stage_characters, clue_hint)
         risk = (beat or {}).get("risk_summary") or (block or {}).get("risk") or cls._turn_risk(story_data, event, stage_characters)
+        fact_anchors = cls._turn_fact_anchors(story_data, event, block, beat)
+        context_characters = cls._context_characters(fact_anchors)
         situation = (
             cls._personalize_protagonist_text((beat or {}).get("first_person_situation"), protagonist)
             or cls._compose_turn_narration(story_data, protagonist, scene, event, block, dialogues, stage_characters)
         )
+        situation = cls._strengthen_situation_with_facts(situation, fact_anchors)
+        if context_only and fact_anchors:
+            situation = cls._personalize_protagonist_text(cls._truncate(" ".join(fact_anchors[:2]), 150), protagonist)
+        objective = cls._clean_play_objective(objective, fact_anchors, protagonist)
         supplemental_hint = cls._supplemental_system_hint(story_data, protagonist, event, block, beat, stage_characters)
+        if not supplemental_hint and fact_anchors:
+            supplemental_hint = cls._fact_hint(fact_anchors)
+        if context_only:
+            supplemental_hint = ""
+        else:
+            supplemental_hint = cls._clean_visible_system_text(supplemental_hint, "background")
         headline = f"场景：{cls._scene_label(scene)}"
 
         turn = {
@@ -819,8 +864,10 @@ class NarrativeEventAdapter:
             "objective": cls._personalize_protagonist_text(objective, protagonist),
             "risk": cls._personalize_protagonist_text(risk, protagonist),
             "supplemental_hint": supplemental_hint,
+            "fact_anchors": fact_anchors,
             "pressure": cls.PHASE_LABELS.get(world_state.get("phase", "setup"), "局势正在变化"),
             "present_characters": stage_characters,
+            "context_characters": context_characters,
             "dialogues": dialogues,
             "actions": actions,
             "dramatic_question": cls._personalize_protagonist_text((beat or {}).get("dramatic_question"), protagonist),
@@ -829,7 +876,14 @@ class NarrativeEventAdapter:
             "state_summary": cls._state_summary(story_data, world_state),
             "mode": "first_person",
             "source_unit": "playable_beat" if beat else "event_block_fallback",
+            "context_only": context_only,
         }
+        system_kind = cls._system_message_kind(turn)
+        visible_situation = cls._clean_visible_system_text(turn.get("situation", ""), system_kind)
+        if not visible_situation and context_only:
+            visible_situation = "一段背景从你脑中掠过，但它暂时没有形成新的行动窗口。"
+        if visible_situation:
+            turn["situation"] = visible_situation
         gate = TurnQualityGate.evaluate(story_data, event, turn, beat, previous_turn)
         turn["quality_gate"] = gate
         turn["compression_mode"] = gate.get("compression_mode", "full")
@@ -843,6 +897,36 @@ class NarrativeEventAdapter:
             turn["dialogues"] = []
             turn["present_characters"] = []
         return turn
+
+    @classmethod
+    def _is_context_only_event(
+        cls,
+        story_data: Dict[str, Any],
+        protagonist: Optional[Dict[str, Any]],
+        event: Dict[str, Any],
+        beat: Optional[Dict[str, Any]],
+        stage_characters: List[Dict[str, Any]],
+        explicit_character_ids: List[str],
+    ) -> bool:
+        if event.get("is_key_node") or "main" in (event.get("tags") or []):
+            return False
+        if stage_characters:
+            return False
+        protagonist_id = (protagonist or {}).get("id")
+        explicit_ids = [item_id for item_id in explicit_character_ids if item_id]
+        if explicit_ids and any(item_id != protagonist_id for item_id in explicit_ids):
+            return False
+        text_blob = " ".join([
+            cls._clean_text(event.get("summary", "")),
+            cls._clean_text((event.get("consequences") or [""])[0]),
+            cls._clean_text((beat or {}).get("first_person_situation", "")),
+        ])
+        if explicit_ids and all(item_id == protagonist_id for item_id in explicit_ids):
+            if cls._looks_like_raw_fragment(text_blob) or CharacterDialogueDirector._looks_like_exposition_fragment(text_blob):
+                return True
+        if ActionDirector._is_memory_context(event, beat):
+            return True
+        return not (event.get("clues") or []) and (beat or {}).get("importance", "minor") != "major"
 
     @classmethod
     def feedback_payload(
@@ -873,12 +957,25 @@ class NarrativeEventAdapter:
             return None
         if msg_type == "character" and not cls._is_valid_speaker(cls._clean_text(author)):
             return None
+        if msg_type == "character" and CharacterDialogueDirector._has_runtime_title_pollution(text):
+            return None
         if msg_type == "character" and story_data:
             character = CharacterRegistry.get_character(story_data, character_id, require_speaking=True)
             if not character:
                 return None
             payload["author"] = character.get("canonical_name") or character.get("name") or author
             payload["character_id"] = character.get("id")
+
+        if msg_type == "scene":
+            text = cls._normalize_scene_message_text(text)
+            if not text:
+                return None
+        if msg_type == "system":
+            text = cls._clean_visible_system_text(text, (payload.get("metadata") or {}).get("kind", ""))
+            if not text:
+                return None
+            if cls._is_low_value_system_text(text):
+                return None
 
         if any(pattern in text for pattern in cls.INTERNAL_PATTERNS):
             return None
@@ -890,6 +987,83 @@ class NarrativeEventAdapter:
         payload["text"] = text
         payload["type"] = msg_type
         return payload
+
+    @classmethod
+    def _system_message_kind(cls, turn: Dict[str, Any], default: str = "narration") -> str:
+        text = " ".join([
+            cls._clean_text(turn.get("situation", "")),
+            cls._clean_text(turn.get("supplemental_hint", "")),
+            " ".join(cls._clean_text(item) for item in (turn.get("fact_anchors") or [])),
+        ])
+        if any(token in text for token in ("齿哥", "利锯", "老克", "旧记忆", "记忆", "职业圈")):
+            return "memory"
+        if turn.get("compression_mode") == "transition":
+            return "transition"
+        if turn.get("context_only") or not turn.get("should_render_full_turn", True):
+            return "background"
+        return default
+
+    @classmethod
+    def _clean_visible_system_text(cls, text: Any, kind: str = "") -> str:
+        cleaned = cls._clean_text(text)
+        if not cleaned:
+            return ""
+        normalized_kind = cls._clean_text(kind).lower()
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        cleaned = re.sub(r"^场景：", "", cleaned).strip() if normalized_kind in {"memory", "background", "transition"} else cleaned
+        cleaned = re.sub(
+            r"^你站在[^，。]{1,32}[里中]，先感觉到的不是声音，而是所有人都在等你先露判断[。；，、\s]*",
+            "",
+            cleaned,
+        ).strip()
+        cleaned = re.sub(
+            r"^你站在[^，。]{1,32}[里中]，所有人都在等你先露判断[。；，、\s]*",
+            "",
+            cleaned,
+        ).strip()
+        cleaned = re.sub(r"^你站在([^，。]{1,32})[里中]，(?=(老克|齿哥|画家|这之前|虽然|一段旧记忆))", "", cleaned).strip()
+        if cleaned.count("“") > cleaned.count("”") and re.search(r"(说|问)[：:]\s*“[^”]{2,}$", cleaned):
+            cleaned = re.sub(r"(说|问)[：:]\s*“", r"\1：“", cleaned)
+            tail = "？”" if cleaned.rstrip().endswith(("?", "？")) else "。”"
+            cleaned = f"{cleaned.rstrip('。！？!? ')}{tail}"
+        if cls._looks_like_raw_fragment(cleaned):
+            return ""
+        if normalized_kind in {"memory", "background", "transition", "compressed_narration", "context_note"}:
+            cleaned = cls._remove_duplicate_sentences(cleaned)
+            cleaned = cleaned.replace("。 ”", "。”").replace("？ ”", "？”").replace("！ ”", "！”")
+        return cleaned.strip(" ，；;")
+
+    @classmethod
+    def _looks_like_raw_fragment(cls, text: str) -> bool:
+        cleaned = cls._clean_text(text)
+        if not cleaned:
+            return True
+        if cleaned.startswith(("”", "’", "\"", "'")):
+            return True
+        if re.search(r"^[”\"']?[\u4e00-\u9fff]{1,8}(说|问|表示)[，。]", cleaned):
+            return True
+        if re.search(r"^[”\"']?你指指那幅画说", cleaned):
+            return True
+        if cleaned.count("“") != cleaned.count("”"):
+            return True
+        if cleaned.startswith("[") or cleaned.endswith("]"):
+            return True
+        return False
+
+    @classmethod
+    def _remove_duplicate_sentences(cls, text: str) -> str:
+        parts = [item.strip() for item in re.split(r"(?<=[。！？!?])\s*", cls._clean_text(text)) if item.strip()]
+        if not parts:
+            return cls._clean_text(text)
+        seen = set()
+        kept = []
+        for part in parts:
+            key = part.rstrip("。！？!?")
+            if key in seen:
+                continue
+            seen.add(key)
+            kept.append(part)
+        return " ".join(kept)
 
     @classmethod
     def _normalize_message_type(cls, msg_type: str, metadata: Dict[str, Any]) -> str:
@@ -906,6 +1080,30 @@ class NarrativeEventAdapter:
         if normalized == "player":
             return "player"
         return normalized if normalized in cls.VISIBLE_TYPES else "system"
+
+    @classmethod
+    def _normalize_scene_message_text(cls, text: str) -> str:
+        cleaned = cls._clean_text(text)
+        cleaned = re.sub(r"^场景：过场：", "过场：", cleaned)
+        cleaned = re.sub(r"^场景：场景：", "场景：", cleaned)
+        if cleaned in {"场景：过场", "过场：过场"}:
+            return ""
+        return cleaned
+
+    @classmethod
+    def _is_low_value_system_text(cls, text: str) -> bool:
+        cleaned = cls._clean_text(text)
+        low_value = (
+            "你站在场景 4里，先感觉到的不是声音，而是所有人都在等你先露判断。",
+            "你站在场景4中，所有人静待你的判断",
+            "你站在场景4中，众人静待你的判断",
+        )
+        return cleaned in low_value
+
+    @classmethod
+    def _is_generic_repeated_system_text(cls, text: str) -> bool:
+        cleaned = cls._clean_text(text)
+        return "先感觉到的不是声音，而是所有人都在等你先露判断" in cleaned
 
     @classmethod
     def _build_intro_dialogues(
@@ -946,6 +1144,8 @@ class NarrativeEventAdapter:
                 cls._resolve_narrative_block(story_data, event),
                 beat=beat,
             )
+            if CharacterDialogueDirector._has_runtime_title_pollution(line):
+                line = CharacterDialogueDirector.safe_fallback_line(story_data, protagonist, character)
             if line:
                 dialogues.append({
                     "speaker": character.get("canonical_name") or character.get("name"),
@@ -982,6 +1182,114 @@ class NarrativeEventAdapter:
             names = "、".join([(item.get("name") or "对方") for item in participants[:2]])
             return f"{names}都在盯你的反应。你一旦把话说穿，接下来整场对话都会沿着你暴露出来的判断走。"
         return "你还没看到全局，但别人已经开始根据你的反应重新排位。"
+
+    @classmethod
+    def _turn_fact_anchors(
+        cls,
+        story_data: Dict[str, Any],
+        event: Optional[Dict[str, Any]],
+        block: Optional[Dict[str, Any]],
+        beat: Optional[Dict[str, Any]],
+    ) -> List[str]:
+        sources: List[str] = []
+        for item in [
+            (event or {}).get("summary", ""),
+            *((event or {}).get("consequences") or []),
+            *((event or {}).get("outcomes") or []),
+            (block or {}).get("summary", ""),
+            (block or {}).get("situation", ""),
+            (beat or {}).get("first_person_situation", ""),
+        ]:
+            cleaned = cls._clean_text(item)
+            if cleaned:
+                sources.append(cleaned)
+        evidence_items = (event or {}).get("evidence") or []
+        if not evidence_items and not event:
+            evidence_items = (beat or {}).get("evidence") or []
+        for evidence in evidence_items:
+            quote = cls._clean_text((evidence or {}).get("quote", ""))
+            if quote:
+                sources.append(quote)
+
+        joined = "；".join(sources)
+        facts: List[str] = []
+        if any(key in joined for key in ("财界精英", "雇职业杀手", "杀三个人", "第一批", "买凶")):
+            facts.append("这场会面不是普通委托：十三名财界精英正在雇你杀人，而且目标不止一个。")
+        if any(key in joined for key in ("多余款项", "退回", "账户", "零的个数", "出价", "款项")):
+            facts.append("那笔多出来的钱不是慷慨，更像是在试探你的职业准则和底线。")
+        if any(key in joined for key in ("年轻", "女性", "整洁", "三人", "第一批")):
+            facts.append("目标里有一个年轻女性，她和另外两人的状态不一样，这个差异本身值得记住。")
+        if any(key in joined for key in ("朱汉杨", "焦虚", "欲望", "不高贵")):
+            facts.append("朱汉杨的眼神焦虚却没有欲望，这和他代表的身份并不相称。")
+        if any(key in joined for key in ("上帝文明", "六个地球", "外星", "地球")):
+            facts.append("上帝文明离开后的现实，是这场交易敢被摆上桌面的背景。")
+        if any(key in joined for key in ("教官", "客户", "前额与后脑勺", "不得见面", "行业")):
+            facts.append("按你的行规，客户本不该和你正面见面；今天这场会面已经越线。")
+        if any(key in joined for key in ("齿哥", "利锯", "第二种方式", "来日方长")):
+            facts.append("齿哥不是当前在场人物，而是你记忆里见过他使用利锯的人；这段回忆是在说明利锯还有更危险的用途。")
+        if not facts:
+            for source in sources:
+                if source and not CharacterDialogueDirector._has_runtime_title_pollution(source):
+                    facts.append(cls._truncate(source, 54))
+                if len(facts) >= 2:
+                    break
+        return list(dict.fromkeys(facts))[:4]
+
+    @classmethod
+    def _context_characters(cls, facts: List[str]) -> List[Dict[str, Any]]:
+        context: List[Dict[str, Any]] = []
+        fact_text = " ".join(facts)
+        if "齿哥" in fact_text:
+            context.append({
+                "id": "context_chige",
+                "name": "齿哥",
+                "role": "记忆人物",
+                "summary": "他不在当前场景里；这是你关于利锯用途的一段旧记忆，用来说明这件工具的危险尺度。",
+            })
+        return context
+
+    @classmethod
+    def _strengthen_situation_with_facts(cls, situation: str, facts: List[str]) -> str:
+        cleaned = cls._clean_text(situation)
+        if not facts:
+            return cleaned
+        memory_fact = next((fact for fact in facts if "齿哥" in fact or "利锯" in fact), "")
+        if memory_fact and cls._is_generic_repeated_system_text(cleaned):
+            return memory_fact
+        if any(fact[:12] in cleaned for fact in facts):
+            return cleaned
+        if "款项" in cleaned and any("多出来的钱" in fact or "款项" in fact for fact in facts):
+            return cleaned
+        if len(cleaned) < 96 or "不知道发生了什么" in cleaned:
+            return cls._clean_text(f"{cleaned} {facts[0]}")
+        return cleaned
+
+    @classmethod
+    def _clean_play_objective(
+        cls,
+        objective: str,
+        facts: List[str],
+        protagonist: Optional[Dict[str, Any]],
+    ) -> str:
+        cleaned = cls._personalize_protagonist_text(objective, protagonist)
+        dirty = (
+            not cleaned
+            or CharacterDialogueDirector._has_runtime_title_pollution(cleaned)
+            or any(token in cleaned for token in ("围绕“你告知”", "围绕“滑膛告知”", "围绕“滑膛发现”", "谁值得接近，谁值得提防"))
+        )
+        if not dirty:
+            return cleaned
+        if any("多出来的钱" in fact or "款项" in fact for fact in facts):
+            return "先弄清楚这笔超额款项是谁放进来的，以及它究竟是在买你的刀，还是在试探你的底线。"
+        if any("雇你杀人" in fact or "目标" in fact for fact in facts):
+            return "先确认这场委托真正要杀的是哪几个人，以及朱汉杨为什么急着让你表态。"
+        return "先把已经露出来的事实连起来，判断眼前这场委托真正想把你推向哪里。"
+
+    @classmethod
+    def _fact_hint(cls, facts: List[str]) -> str:
+        if not facts:
+            return ""
+        return cls._truncate(" ".join(facts[:2]), 96)
 
     @classmethod
     def _personalize_protagonist_text(cls, text: str, protagonist: Optional[Dict[str, Any]]) -> str:
@@ -1050,6 +1358,28 @@ class NarrativeEventAdapter:
             for item_id in filtered_ids
             if CharacterRegistry.get_character(story_data, item_id, require_speaking=True)
         ]
+
+    @classmethod
+    def _allow_speaker_fallback(
+        cls,
+        story_data: Dict[str, Any],
+        protagonist: Optional[Dict[str, Any]],
+        event: Optional[Dict[str, Any]],
+        beat: Optional[Dict[str, Any]],
+        explicit_character_ids: List[str],
+    ) -> bool:
+        protagonist_id = (protagonist or {}).get("id")
+        explicit_ids = [item_id for item_id in explicit_character_ids if item_id]
+        if explicit_ids and all(item_id == protagonist_id for item_id in explicit_ids):
+            return False
+        text_blob = " ".join([
+            cls._clean_text((event or {}).get("summary", "")),
+            cls._clean_text(((event or {}).get("consequences") or [""])[0]),
+            cls._clean_text((beat or {}).get("first_person_situation", "")),
+        ])
+        if any(token in text_blob for token in ("齿哥", "利锯", "回忆", "听说过")):
+            return False
+        return True
 
     @classmethod
     def _speaker_candidates_from_ids(
@@ -1172,11 +1502,10 @@ class NarrativeEventAdapter:
         participants: List[Dict[str, Any]],
     ) -> str:
         sources = []
-        for evidence in ((beat or {}).get("evidence") or [])[:2]:
-            quote = cls._clean_text((evidence or {}).get("quote", ""))
-            if quote:
-                sources.append(quote)
-        for evidence in ((event or {}).get("evidence") or [])[:2]:
+        evidence_items = (event or {}).get("evidence") or []
+        if not evidence_items and not event:
+            evidence_items = (beat or {}).get("evidence") or []
+        for evidence in evidence_items[:2]:
             quote = cls._clean_text((evidence or {}).get("quote", ""))
             if quote:
                 sources.append(quote)
@@ -1198,6 +1527,8 @@ class NarrativeEventAdapter:
             filtered.append(item)
         if not filtered:
             return ""
+        if any("齿哥" in item or "利锯" in item for item in filtered):
+            return cls._heuristic_system_hint(" ".join(filtered))
         llm_hint = cls._llm_system_hint(story_data, protagonist, event, block, beat, participants, filtered[:3])
         if llm_hint:
             return llm_hint
@@ -1272,11 +1603,17 @@ class NarrativeEventAdapter:
             return ""
         if any(token in line for token in ("你应该", "最好", "现在要", "立刻", "选择")):
             return ""
+        source_text = cls._clean_text("；".join(sources))
+        invented_locations = ("办公室", "地下室", "走廊", "电梯", "机房", "街边", "酒店房间")
+        if any(token in line for token in invented_locations) and not any(token in source_text for token in invented_locations):
+            return ""
         return cls._truncate(line, 54)
 
     @classmethod
     def _heuristic_system_hint(cls, text: str) -> str:
         cleaned = cls._clean_text(text)
+        if "齿哥" in cleaned or "利锯" in cleaned:
+            return "齿哥不是当前在场人物，而是你记忆中的旧人；这段回忆是在说明利锯的危险用途。"
         if "财界精英" in cleaned or "职业杀手" in cleaned:
             return "你面前这些人不是普通客户，他们今天坐在这里，是来谈买凶的。"
         if "上帝文明" in cleaned or "外星" in cleaned:
@@ -1613,6 +1950,8 @@ class ActionDirector:
         response_mode = bool(previous_turn.get("last_action") or previous_turn.get("latest_feedback"))
         if response_mode and primary_character:
             return cls._response_actions(story_data, event, primary_character, clue)
+        if cls._is_memory_context(event, beat) and not primary_character:
+            return cls._memory_context_actions(event)
 
         if beat and beat.get("suggested_action_intents"):
             options.extend(
@@ -1702,6 +2041,36 @@ class ActionDirector:
         return deduped[:4]
 
     @classmethod
+    def _is_memory_context(cls, event: Dict[str, Any], beat: Optional[Dict[str, Any]]) -> bool:
+        text = " ".join([
+            NarrativeEventAdapter._clean_text(event.get("summary", "")),
+            NarrativeEventAdapter._clean_text(((event.get("consequences") or [""])[0])),
+            NarrativeEventAdapter._clean_text((beat or {}).get("first_person_situation", "")),
+        ])
+        return any(token in text for token in ("齿哥", "利锯", "第二种方式", "来日方长"))
+
+    @classmethod
+    def _memory_context_actions(cls, event: Dict[str, Any]) -> List[DecisionOption]:
+        return [
+            DecisionOption(
+                id=f"{event['id']}_memory_hold",
+                label="把齿哥和利锯这段记忆先压住，继续听眼前这场委托往下说",
+                impact="你不让旧记忆打乱当下判断，只把它当成危险尺度记在心里。",
+                risk="如果这段记忆正是关键提示，你可能会晚一步才意识到它和委托有关。",
+                action_type="observe",
+                target_event_id=event["id"],
+            ),
+            DecisionOption(
+                id=f"{event['id']}_memory_link",
+                label="先在心里把利锯、齿哥和这次委托连起来，判断它为什么会在此刻浮上来",
+                impact="你暂停对话节奏，把旧记忆和当前委托之间的关系重新压实。",
+                risk="你停得太久，会让场上的人察觉你想到了别的东西。",
+                action_type="observe",
+                target_event_id=event["id"],
+            ),
+        ]
+
+    @classmethod
     def _response_actions(
         cls,
         story_data: Dict[str, Any],
@@ -1767,7 +2136,12 @@ class ActionDirector:
         options: List[DecisionOption] = []
         secondary_character = None
         if primary_character:
-            visible = [item for item in NarrativeEventAdapter._visible_speakers(story_data) if item.get("id") != primary_character.get("id")]
+            protagonist_id = (ProtagonistResolver.resolve(story_data) or {}).get("id")
+            visible = [
+                item for item in NarrativeEventAdapter._visible_speakers(story_data)
+                if item.get("id") != primary_character.get("id")
+                and item.get("id") != protagonist_id
+            ]
             secondary_character = visible[0] if visible else None
         for index, intent in enumerate(intents[:5], 1):
             action = NarrativeEventAdapter._clean_text(intent)
@@ -1907,6 +2281,27 @@ class CharacterDialogueDirector:
     }
 
     @classmethod
+    def safe_fallback_line(
+        cls,
+        story_data: Dict[str, Any],
+        protagonist: Optional[Dict[str, Any]],
+        character: Dict[str, Any],
+    ) -> str:
+        name = character.get("canonical_name") or character.get("name") or "对方"
+        last_action = cls._latest_player_action(story_data)
+        if name == "朱汉杨":
+            if "沉默" in last_action:
+                return "朱汉杨看着你：“不接话也算表态。只是我得知道，你这份沉默压在哪边。”"
+            if "打断" in last_action or "别绕" in last_action:
+                return "朱汉杨看着你：“你想要直话，可以。但直话通常最贵。”"
+            return "朱汉杨看着你：“我说到这里，剩下的要看你敢不敢接。”"
+        if name == "许雪萍":
+            if "沉默" in last_action:
+                return "许雪萍轻声说：“你不说话，他们反而会更急。”"
+            return "许雪萍轻声说：“别急着接他的节奏。先看谁最怕你问下去。”"
+        return f"{name}看着你：“这句话我先放在这里，你自己判断。”"
+
+    @classmethod
     def intro_line(
         cls,
         story_data: Dict[str, Any],
@@ -1964,6 +2359,11 @@ class CharacterDialogueDirector:
             )
             return cls._wrap_line(name, llm_line)
 
+        anchored_line = cls._anchored_fallback_line(story_data, protagonist, character, event, block, beat)
+        if anchored_line:
+            logger.info("Story dialogue generated: character=%s mode=fallback event=%s", name, event.get("id") or "unknown")
+            return cls._wrap_line(name, anchored_line)
+
         if name == "许雪萍":
             logger.info("Story dialogue generated: character=%s mode=fallback event=%s", name, event.get("id") or "unknown")
             return cls._xueping_line(knowledge, danger, relation, secret_pressure)
@@ -1988,6 +2388,43 @@ class CharacterDialogueDirector:
             return f"{name}没有把话说满：“{cls._soften_fragment(danger)}”"
         logger.info("Story dialogue generated: character=%s mode=fallback event=%s", name, event.get("id") or "unknown")
         return f"{name}盯着你看了一秒：“{cls._soften_fragment(danger)}”"
+
+    @classmethod
+    def _anchored_fallback_line(
+        cls,
+        story_data: Dict[str, Any],
+        protagonist: Optional[Dict[str, Any]],
+        character: Dict[str, Any],
+        event: Dict[str, Any],
+        block: Optional[Dict[str, Any]],
+        beat: Optional[Dict[str, Any]],
+    ) -> str:
+        name = NarrativeEventAdapter._clean_text(character.get("canonical_name") or character.get("name") or "对方")
+        last_action = cls._latest_player_action(story_data)
+        facts = NarrativeEventAdapter._turn_fact_anchors(story_data, event, block, beat)
+        fact_text = "；".join(facts)
+        asks_money = any(token in last_action for token in ("款项", "钱", "多少", "零"))
+        asks_task = any(token in last_action for token in ("干什么", "要我做什么", "想让我", "委托", "杀"))
+        asks_target = any(token in last_action for token in ("谁", "目标", "背书", "替谁"))
+        if name == "朱汉杨":
+            if asks_money:
+                return "钱只是第一道门槛。数额够不够，不如你肯不肯接重要。"
+            if asks_task or "雇你杀人" in fact_text:
+                return "要你做的事很简单，也很脏：三个人，先从第一批开始。"
+            if asks_target:
+                return "别急着找替谁背书。先看清是谁把刀递到你手里。"
+            if "多出来的钱" in fact_text or "款项" in fact_text:
+                return "多出来的那部分不是酬金，是看你会不会被价码牵着走。"
+            if "年轻女性" in fact_text:
+                return "那三个人里，最不该被忽略的，是那个收拾得太整齐的女人。"
+        if name == "许雪萍":
+            if asks_money:
+                return "那笔钱不是重点。重点是谁想用钱先替你定规矩。"
+            if asks_task or asks_target:
+                return "他们想让你看见委托，却不想让你看清委托后面的人。"
+            if "多出来的钱" in fact_text or "款项" in fact_text:
+                return "他把钱摆得太亮了，亮到像是故意让你先看见。"
+        return ""
 
     @classmethod
     def _runtime_state(cls, story_data: Dict[str, Any], character_id: Optional[str]) -> Dict[str, Any]:
@@ -2154,6 +2591,7 @@ class CharacterDialogueDirector:
         protagonist_name = NarrativeEventAdapter._clean_text((protagonist or {}).get("canonical_name") or (protagonist or {}).get("name") or "你")
         last_action = cls._latest_player_action(story_data)
         latest_feedback = NarrativeEventAdapter._clean_text(((story_data.get("play_state") or {}).get("latest_feedback") or {}).get("summary", ""))
+        fact_anchors = NarrativeEventAdapter._turn_fact_anchors(story_data, event, block, beat)
         goals = [NarrativeEventAdapter._clean_text(item) for item in runtime.get("goals", []) if NarrativeEventAdapter._clean_text(item)]
         guardrails = [NarrativeEventAdapter._clean_text(item) for item in runtime.get("value_guardrails", []) if NarrativeEventAdapter._clean_text(item)]
         prompt_bits = [
@@ -2167,6 +2605,7 @@ class CharacterDialogueDirector:
             f"当前局面：{NarrativeEventAdapter._clean_text((beat or {}).get('first_person_situation', '')) or NarrativeEventAdapter._clean_text((event or {}).get('summary', ''))}",
             f"玩家刚才动作：{last_action or '尚未明确动作'}",
             f"动作反馈：{latest_feedback or '场面刚刚起变化'}",
+            f"本轮必须承接的事实：{'；'.join(fact_anchors) or '没有可靠事实锚点时，不要编造新事实'}",
             f"角色手里真正能说的内容：{knowledge or '此刻不宜直接说透'}",
             f"角色此刻担心的风险：{danger or '一旦说错，局面会更快失控'}",
             f"事件钩子：{NarrativeEventAdapter._clean_text((event or {}).get('title', '')) or '局势正在推进'}",
@@ -2178,6 +2617,9 @@ class CharacterDialogueDirector:
             "只输出这个角色此刻会对主角说的一句自然台词。"
             "不要输出旁白、动作描写、说话人名字、引号、解释、总结、分析。"
             "不要复述原著旁白，不要使用“但你怎么理解，是你的事”“不要当场把话说透”这种模板尾巴。"
+            "必须明确承接玩家刚才动作或问题，不能只说谜语。"
+            "如果玩家问的是“想让我干什么/款项/目标/谁出价”，台词必须至少触碰一个事实锚点，但可以保留角色的回避。"
+            "不得提到事实锚点里没有的档案、页码、名单、名字、录音、监控或地址。"
             "必须像真人当场说出来的话，长度控制在12到36个汉字，允许一到两句短句。"
             "角色不能说自己不知道的信息。"
         )
@@ -2213,6 +2655,8 @@ class CharacterDialogueDirector:
         line = NarrativeEventAdapter._clean_text((result or {}).get("line", ""))
         line = cls._normalize_generated_line(line, name)
         if not line:
+            return ""
+        if cls._line_escapes_fact_scope(line, fact_anchors):
             return ""
         return line
 
@@ -2261,12 +2705,25 @@ class CharacterDialogueDirector:
             "我只说一次，听不听得进去，看你",
             "判断当前局势尚未明朗",
             "推动当前剧情",
+            "告知",
+            "发现",
         )
         if any(token in line for token in blocked):
             return ""
         if len(line) < 5 or len(line) > 48:
             return ""
         return line
+
+    @classmethod
+    def _line_escapes_fact_scope(cls, line: str, facts: List[str]) -> bool:
+        cleaned = NarrativeEventAdapter._clean_text(line)
+        fact_text = "；".join(facts)
+        invented_artifacts = ("档案", "第三页", "文件夹", "名单", "名字", "排在第几", "录音", "监控录像", "地址")
+        if any(token in cleaned for token in invented_artifacts) and not any(token in fact_text for token in invented_artifacts):
+            return True
+        if "年轻" in cleaned and "目标" not in fact_text and "女性" not in fact_text:
+            return True
+        return False
 
     @classmethod
     def _wrap_line(cls, name: str, line: str) -> str:
@@ -2292,6 +2749,8 @@ class CharacterDialogueDirector:
         cleaned = cleaned.replace("“", "").replace("”", "")
         cleaned = re.sub(r"^[，,。；;:“”\"'`]+", "", cleaned)
         cleaned = re.sub(r"^(朱汉杨|许雪萍|滑膛)[\s：:，,]*", "", cleaned)
+        if cls._has_runtime_title_pollution(cleaned):
+            return ""
         if any(
             pattern in cleaned
             for pattern in (
@@ -2326,6 +2785,24 @@ class CharacterDialogueDirector:
         if len(cleaned) < 4:
             return ""
         return cleaned
+
+    @classmethod
+    def _has_runtime_title_pollution(cls, text: str) -> bool:
+        cleaned = NarrativeEventAdapter._clean_text(text)
+        if not cleaned:
+            return False
+        if re.search(r"[‘'“\"]?[\u4e00-\u9fff]{1,8}(告知|发现|联系|离开|进入|打开|查看|决定)[’'”\"]?", cleaned):
+            return True
+        return any(
+            token in cleaned
+            for token in (
+                "刚才那句‘告知’",
+                "刚才那句'告知'",
+                "那句告知",
+                "事件标题",
+                "响应事件",
+            )
+        )
 
     @classmethod
     def _is_generic_fragment(cls, text: str) -> bool:
@@ -2560,6 +3037,14 @@ class ActionResolutionEngine:
                 risks=["你把先手让给了别人。"],
                 next_pressure="下一轮变化不会等你准备好才发生。",
             )
+        raw = NarrativeEventAdapter._clean_text(data.get("raw", ""))
+        if any(token in raw for token in ("为什么", "什么", "谁", "哪", "吗", "？", "?")):
+            return NarrativeEventAdapter.feedback_payload(
+                summary="你把问题直接留在桌面上。没人能再假装这只是交易流程；下一句回答如果还绕开事实，就会显得更刻意。",
+                gains=["你把对话从试探拉回到了事实本身。"],
+                risks=["问得太直，会让对方先判断你已经知道多少，再决定给你哪一层答案。"],
+                next_pressure="接下来最关键的是，对方会回答问题，还是先处理你为什么会这么问。",
+            )
         return NarrativeEventAdapter.feedback_payload(
             summary="你把这句话说出口后，场面没有立刻炸开，但安静本身已经变了味。有人会先记住你的措辞，再决定怎么顺着它出手。",
             gains=["你主动把新的变量扔进了这场对话。"],
@@ -2704,6 +3189,11 @@ class PlotDirector:
         author = NarrativeEventAdapter._clean_text(message.get("author", ""))
         if not text:
             return None
+        if msg_type == "scene":
+            normalized_scene = NarrativeEventAdapter._normalize_scene_message_text(text)
+            return (msg_type, "", normalized_scene)
+        if msg_type == "system" and NarrativeEventAdapter._is_generic_repeated_system_text(text):
+            return (msg_type, "", "generic_scene_tension")
         return (msg_type, author, text)
 
     @classmethod
@@ -2806,6 +3296,8 @@ class ChatDrivenPlayRuntimeService:
         play_state["pending_messages"] = NarrativeEventAdapter.sanitize_visible_messages(play_state.get("pending_messages", []), story_data)
         queue_state = WorldState(**_world_state_dict(story_data))
         play_state["event_queue"] = PlayEventQueue.ensure(story_data, queue_state, play_state)
+        cls._prune_redundant_continuation_tail(story_data, play_state)
+        queue_state.candidate_event_ids = PlayEventQueue.derive_candidate_event_ids(play_state.get("event_queue", []))
         story_data["world_state"] = queue_state.__dict__
 
         decision = play_state.get("current_decision") or None
@@ -2824,7 +3316,7 @@ class ChatDrivenPlayRuntimeService:
         current_turn = play_state.get("current_turn")
         active_entry = PlayEventQueue.get_active_entry(play_state)
         active_event_id = (active_entry or {}).get("event_id")
-        if not current_turn or cls._turn_needs_refresh(current_turn) or (
+        if not current_turn or cls._turn_needs_refresh(current_turn, play_state) or (
             active_event_id and current_turn.get("event_id") != active_event_id
         ):
             current_event_id = active_event_id or (current_turn or {}).get("event_id")
@@ -2835,7 +3327,7 @@ class ChatDrivenPlayRuntimeService:
             else:
                 play_state["current_turn"] = NarrativeEventAdapter.build_intro_turn(story_data, protagonist)
             play_state["turn_history"] = [play_state["current_turn"]]
-        elif not play_state["current_turn"].get("block_id"):
+        elif play_state["current_turn"].get("source_unit") != "chapter_complete" and not play_state["current_turn"].get("block_id"):
             current_event_id = active_event_id or play_state["current_turn"].get("event_id")
             current_event = next((item for item in story_data.get("events", []) if item.get("id") == current_event_id), None)
             beat = NarrativeEventAdapter._resolve_playable_beat(story_data, current_event)
@@ -2864,7 +3356,11 @@ class ChatDrivenPlayRuntimeService:
                         )
                     ]
 
-        if cls._decision_needs_refresh(play_state.get("current_decision")):
+        if cls._decision_needs_refresh(play_state.get("current_decision")) or (
+            not play_state.get("current_decision")
+            and (play_state.get("current_turn") or {}).get("actions")
+            and not (play_state.get("current_turn") or {}).get("last_action")
+        ):
             current_event_id = (play_state.get("current_turn") or {}).get("event_id")
             current_event = next((item for item in story_data.get("events", []) if item.get("id") == current_event_id), None)
             if current_event:
@@ -2880,6 +3376,27 @@ class ChatDrivenPlayRuntimeService:
         return play_state
 
     @classmethod
+    def _prune_redundant_continuation_tail(cls, story_data: Dict[str, Any], play_state: Dict[str, Any]) -> None:
+        events_by_id = {item.get("id"): item for item in story_data.get("events", [])}
+        changed = False
+        for entry in play_state.get("event_queue", []):
+            event_id = str(entry.get("event_id") or "")
+            event = events_by_id.get(event_id) or {}
+            if (
+                entry.get("status") == "pending"
+                and event.get("source") == "continuation_engine"
+                and re.match(r"^continuation_\d+_event_([2-9]|\d{2,})$", event_id)
+            ):
+                entry["status"] = "skipped"
+                entry["debug_reason"] = "；".join(filter(None, [
+                    NarrativeEventAdapter._clean_text(entry.get("debug_reason", "")),
+                    "续章尾部重复过场已跳过",
+                ]))
+                changed = True
+        if changed:
+            play_state["event_queue"] = PlayEventQueue._sort_queue(play_state.get("event_queue", []))
+
+    @classmethod
     def snapshot(cls, story_data: Dict[str, Any]) -> Dict[str, Any]:
         play_state = cls.ensure_play_state(story_data)
         return {
@@ -2890,6 +3407,38 @@ class ChatDrivenPlayRuntimeService:
         }
 
     @classmethod
+    def release_due_feed_messages(cls, story_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Release delayed feed messages without advancing the story beat queue."""
+        play_state = cls.ensure_play_state(story_data)
+        cls._sync_current_turn_messages(story_data, play_state)
+        released = PlotDirector.release_due_messages(play_state, story_data)
+        current_turn = play_state.get("current_turn") or {}
+        if (
+            not released
+            and not play_state.get("pending_messages")
+            and not play_state.get("current_decision")
+            and not current_turn.get("should_render_full_turn", True)
+        ):
+            play_state.setdefault("director", {})["next_story_beat_at"] = _now_iso()
+        if (
+            not released
+            and not play_state.get("chapter_complete")
+            and PlotDirector.should_advance_story(play_state, story_data)
+        ):
+            cls._advance_next_event_once(story_data, play_state, ProtagonistResolver.resolve(story_data))
+            PlotDirector.release_due_messages(play_state, story_data)
+        if (
+            not play_state.get("chapter_complete")
+            and not play_state.get("pending_messages")
+            and not play_state.get("current_decision")
+            and not any(item.get("status") == "pending" for item in play_state.get("event_queue", []))
+        ):
+            cls._handle_queue_exhausted(story_data, play_state, ProtagonistResolver.resolve(story_data))
+            PlotDirector.release_due_messages(play_state, story_data)
+        play_state["last_tick_at"] = _now_iso()
+        return play_state
+
+    @classmethod
     def start_session(cls, story_data: Dict[str, Any]) -> Dict[str, Any]:
         play_state = cls.ensure_play_state(story_data)
         if not play_state["session_started"]:
@@ -2898,108 +3447,489 @@ class ChatDrivenPlayRuntimeService:
         return play_state
 
     @classmethod
-    def tick(cls, story_data: Dict[str, Any]) -> Dict[str, Any]:
+    def tick(cls, story_data: Dict[str, Any], trigger: str = "auto") -> Dict[str, Any]:
         play_state = cls.ensure_play_state(story_data)
         protagonist = ProtagonistResolver.resolve(story_data)
         if not play_state["session_started"]:
             cls.start_session(story_data)
+        play_state["last_tick_trigger"] = trigger
+        if trigger == "manual" and play_state.get("current_decision"):
+            cls._queue_manual_blocked_message(play_state, story_data)
+            PlotDirector.release_due_messages(play_state, story_data)
+            play_state["last_tick_at"] = _now_iso()
+            return play_state
+        if trigger == "manual" and not play_state.get("chapter_complete"):
+            cls._append_manual_advance_marker(play_state)
+        if play_state.get("chapter_complete"):
+            # Play runtime should not silently invent a new conflict when the
+            # current queue ends. The continuation page is the explicit place
+            # for post-ending generation; otherwise truncated imports look like
+            # the original story ended early.
+            PlotDirector.release_due_messages(play_state, story_data)
+            play_state["last_tick_at"] = _now_iso()
+            return play_state
 
         released = PlotDirector.release_due_messages(play_state, story_data)
         if not released and PlotDirector.should_advance_story(play_state, story_data):
-            attempts = 0
-            while attempts < 4:
-                attempts += 1
-                world_state = WorldState(**_world_state_dict(story_data))
-                next_event = NarrativePlanner.choose_next_event(story_data, world_state)
-                if not next_event:
-                    break
-                result = WorldStateEngine.apply_event(story_data, world_state, next_event["id"])
-                story_data["world_state"] = result["world_state"].__dict__
-                current_turn = NarrativeEventAdapter.build_turn(story_data, next_event, protagonist)
-                PlayEventQueue.mark_turn_generated(play_state, next_event["id"])
-                play_state["latest_feedback"] = None
-                gate = current_turn.get("quality_gate") or {}
-                logger.info(
-                    "Story tick evaluate: event=%s importance=%s allow_full_turn=%s compression=%s reasons=%s actions=%s dialogues=%s",
-                    _event_debug_label(next_event),
-                    gate.get("importance") or current_turn.get("importance"),
-                    gate.get("allow_full_turn"),
-                    gate.get("compression_mode"),
-                    ",".join(gate.get("reasons") or []) or "none",
-                    len(current_turn.get("actions") or []),
-                    len(current_turn.get("dialogues") or []),
-                )
-
-                if NarrativeCompressor.should_compress(current_turn):
-                    compressed = NarrativeCompressor.consume_progression(
-                        story_data,
-                        play_state,
-                        protagonist,
-                        next_event,
-                        current_turn,
-                    )
-                    compressed_turn = compressed.get("turn")
-                    if compressed_turn:
-                        cls._push_turn(play_state, compressed_turn)
-                        play_state["current_turn"] = compressed_turn
-                        play_state["current_decision"] = None
-                        play_state["active_plot_node_id"] = None
-                        PlotDirector.queue_messages(
-                            play_state,
-                            story_data,
-                            compressed.get("messages", []),
-                            immediate=True,
-                        )
-                        scheduled_event_id = (compressed.get("event_ids") or [next_event["id"]])[-1]
-                        scheduled_event = next(
-                            (item for item in story_data.get("events", []) if item.get("id") == scheduled_event_id),
-                            next_event,
-                        )
-                        PlotDirector.after_event_scheduled(play_state, story_data, scheduled_event)
-                        PlotDirector.release_due_messages(play_state, story_data)
-                        break
-                    logger.info(
-                        "Story tick background progression consumed without frontend turn: root_event=%s",
-                        _event_debug_label(next_event),
-                    )
-                    continue
-
-                cls._push_turn(play_state, current_turn)
-                play_state["current_turn"] = current_turn
-                logger.info(
-                    "Story tick full turn emitted: event=%s messages=%s actions=%s dialogues=%s",
-                    _event_debug_label(next_event),
-                    len(NarrativeEventAdapter.event_messages(story_data, next_event, current_turn)),
-                    len(current_turn.get("actions") or []),
-                    len(current_turn.get("dialogues") or []),
-                )
-                PlotDirector.queue_messages(
-                    play_state,
-                    story_data,
-                    NarrativeEventAdapter.event_messages(story_data, next_event, current_turn),
-                    immediate=True,
-                )
-                if next_event.get("is_key_node") or "main" in next_event.get("tags", []):
-                    plot_node = MainPlotNodeManager.build_plot_node(story_data, next_event, protagonist)
-                    if plot_node:
-                        play_state["current_decision"] = asdict(plot_node)
-                        play_state["active_plot_node_id"] = plot_node.id
-                    else:
-                        play_state["current_decision"] = None
-                        play_state["active_plot_node_id"] = None
-                else:
-                    play_state["current_decision"] = None
-                    play_state["active_plot_node_id"] = None
-                PlotDirector.after_event_scheduled(play_state, story_data, next_event)
-                PlotDirector.release_due_messages(play_state, story_data)
-                break
+            cls._advance_next_event_once(story_data, play_state, protagonist)
 
         play_state["last_tick_at"] = _now_iso()
         return play_state
 
     @classmethod
+    def _advance_next_event_once(
+        cls,
+        story_data: Dict[str, Any],
+        play_state: Dict[str, Any],
+        protagonist: Optional[Dict[str, Any]],
+    ) -> bool:
+        protagonist = protagonist or ProtagonistResolver.resolve(story_data)
+        attempts = 0
+        while attempts < 4:
+            attempts += 1
+            world_state = WorldState(**_world_state_dict(story_data))
+            next_event = NarrativePlanner.choose_next_event(story_data, world_state)
+            if not next_event:
+                cls._handle_queue_exhausted(story_data, play_state, protagonist)
+                return False
+            result = WorldStateEngine.apply_event(story_data, world_state, next_event["id"])
+            story_data["world_state"] = result["world_state"].__dict__
+            current_turn = NarrativeEventAdapter.build_turn(story_data, next_event, protagonist)
+            PlayEventQueue.mark_turn_generated(play_state, next_event["id"])
+            play_state["latest_feedback"] = None
+            previous_turn = play_state.get("current_turn") or {}
+            gate = current_turn.get("quality_gate") or {}
+            logger.info(
+                "Story tick evaluate: event=%s importance=%s allow_full_turn=%s compression=%s reasons=%s actions=%s dialogues=%s",
+                _event_debug_label(next_event),
+                gate.get("importance") or current_turn.get("importance"),
+                gate.get("allow_full_turn"),
+                gate.get("compression_mode"),
+                ",".join(gate.get("reasons") or []) or "none",
+                len(current_turn.get("actions") or []),
+                len(current_turn.get("dialogues") or []),
+            )
+
+            if NarrativeCompressor.should_compress(current_turn):
+                compressed = NarrativeCompressor.consume_progression(
+                    story_data,
+                    play_state,
+                    protagonist,
+                    next_event,
+                    current_turn,
+                )
+                compressed_turn = compressed.get("turn")
+                if compressed_turn:
+                    cls._push_turn(play_state, compressed_turn)
+                    play_state["current_turn"] = compressed_turn
+                    play_state["current_decision"] = None
+                    play_state["active_plot_node_id"] = None
+                    PlotDirector.queue_messages(
+                        play_state,
+                        story_data,
+                        compressed.get("messages", []),
+                        immediate=True,
+                    )
+                    scheduled_event_id = (compressed.get("event_ids") or [next_event["id"]])[-1]
+                    scheduled_event = next(
+                        (item for item in story_data.get("events", []) if item.get("id") == scheduled_event_id),
+                        next_event,
+                    )
+                    PlotDirector.after_event_scheduled(play_state, story_data, scheduled_event)
+                    PlotDirector.release_due_messages(play_state, story_data)
+                    return True
+                logger.info(
+                    "Story tick background progression consumed without frontend turn: root_event=%s",
+                    _event_debug_label(next_event),
+                )
+                continue
+
+            cls._push_turn(play_state, current_turn)
+            turn_messages = NarrativeEventAdapter.event_messages(
+                story_data,
+                next_event,
+                current_turn,
+                previous_turn=previous_turn,
+            )
+            play_state["current_turn"] = current_turn
+            logger.info(
+                "Story tick full turn emitted: event=%s messages=%s actions=%s dialogues=%s",
+                _event_debug_label(next_event),
+                len(turn_messages),
+                len(current_turn.get("actions") or []),
+                len(current_turn.get("dialogues") or []),
+            )
+            PlotDirector.queue_messages(
+                play_state,
+                story_data,
+                turn_messages,
+                immediate=True,
+            )
+            if next_event.get("is_key_node") or "main" in next_event.get("tags", []):
+                plot_node = MainPlotNodeManager.build_plot_node(story_data, next_event, protagonist)
+                if plot_node:
+                    play_state["current_decision"] = asdict(plot_node)
+                    play_state["active_plot_node_id"] = plot_node.id
+                else:
+                    play_state["current_decision"] = None
+                    play_state["active_plot_node_id"] = None
+            else:
+                play_state["current_decision"] = None
+                play_state["active_plot_node_id"] = None
+            PlotDirector.after_event_scheduled(play_state, story_data, next_event)
+            PlotDirector.release_due_messages(play_state, story_data)
+            return True
+        return False
+
+    @classmethod
+    def _queue_manual_blocked_message(cls, play_state: Dict[str, Any], story_data: Dict[str, Any]) -> None:
+        existing = list(play_state.get("feed") or []) + list(play_state.get("pending_messages") or [])
+        if existing and (existing[-1].get("metadata") or {}).get("kind") == "manual_tick_blocked":
+            return
+        PlotDirector.queue_messages(
+            play_state,
+            story_data,
+            [
+                NarrativeEventAdapter._message(
+                    "system",
+                    "这是一个需要你表态的节点。先选一个动作，或直接用自由输入开口；系统不会替你跳过这一步。",
+                    metadata={"kind": "manual_tick_blocked", "layer": "system", "trigger": "manual"},
+                )
+            ],
+            immediate=True,
+        )
+
+    @classmethod
+    def _append_manual_advance_marker(cls, play_state: Dict[str, Any]) -> None:
+        feed = play_state.setdefault("feed", [])
+        if feed and (feed[-1].get("metadata") or {}).get("kind") == "manual_advance":
+            return
+        feed.append(
+            NarrativeEventAdapter._message(
+                "player",
+                "继续推进",
+                author="你",
+                metadata={"kind": "manual_advance", "trigger": "manual"},
+            )
+        )
+
+    @classmethod
+    def _handle_queue_exhausted(
+        cls,
+        story_data: Dict[str, Any],
+        play_state: Dict[str, Any],
+        protagonist: Optional[Dict[str, Any]],
+    ) -> None:
+        if play_state.get("chapter_complete"):
+            return
+        world_state = _world_state_dict(story_data)
+        for entry in play_state.get("event_queue", []):
+            if entry.get("status") == "active":
+                entry["status"] = "consumed" if entry.get("turn_generated") else "skipped"
+                entry["debug_reason"] = f"{entry.get('debug_reason', '')}；队列结束时自动收束".strip("；")
+        world_state["candidate_event_ids"] = PlayEventQueue.derive_candidate_event_ids(play_state.get("event_queue", []))
+        story_data["world_state"] = world_state
+        protagonist_name = (protagonist or {}).get("canonical_name") or (protagonist or {}).get("name") or "你"
+        turn = {
+            "id": f"turn_chapter_complete_{uuid.uuid4().hex[:8]}",
+            "mode": "first_person",
+            "source_unit": "chapter_complete",
+            "headline": "本章告一段落",
+            "situation": f"你以{protagonist_name}的身份推进到了当前导入文本的末尾。系统不会在游玩页里自动捏造后续冲突；如果原文还没结束，请重新抽取世界以补齐剩余叙事节拍。",
+            "objective": "确认这是否是真正的原文终点；如果不是，回到总览重新抽取世界。",
+            "risk": "如果继续停在同一现场，系统只会重复已经完成的过场。",
+            "scene_id": world_state.get("current_scene_id"),
+            "scene_label": "本章收束",
+            "importance": "resolution",
+            "compression_mode": "complete",
+            "should_render_full_turn": False,
+            "dialogues": [],
+            "present_characters": [],
+            "actions": cls._chapter_complete_actions(),
+            "quality_gate": {
+                "allow_full_turn": False,
+                "compression_mode": "complete",
+                "importance": "resolution",
+                "reasons": ["chapter_complete"],
+                "signals": {},
+            },
+            "state_summary": NarrativeEventAdapter._state_summary(story_data, world_state),
+        }
+        cls._push_turn(play_state, turn)
+        play_state["current_turn"] = turn
+        play_state["current_decision"] = None
+        play_state["active_plot_node_id"] = None
+        play_state["pending_messages"] = []
+        play_state["chapter_complete"] = True
+        PlotDirector.queue_messages(
+            play_state,
+            story_data,
+            [
+                NarrativeEventAdapter._message(
+                    "system",
+                    turn["situation"],
+                    metadata={"kind": "chapter_complete", "layer": "system"},
+                )
+            ],
+            immediate=True,
+        )
+        logger.info("Story event queue exhausted: chapter_complete world=%s", story_data.get("story_id", "unknown"))
+
+    @classmethod
+    def _chapter_complete_actions(cls) -> List[Dict[str, Any]]:
+        return [
+            {
+                "id": "chapter_review_state",
+                "label": "先停一步，把这一轮暴露的信息重新梳理清楚",
+                "action_type": "review_chapter",
+                "impact": "你会得到一段更清晰的局势回看。",
+                "risk": "局势不会前进，但你能更稳地判断下一步。",
+                "target_character_id": None,
+                "target_clue_id": None,
+                "target_event_id": None,
+            },
+            {
+                "id": "chapter_open_continuation",
+                "label": "进入原文结束后的续写页",
+                "action_type": "open_continuation",
+                "impact": "只在原文主线真的推进完后，用世界状态生成后续篇章。",
+                "risk": "如果原文还没抽完，应优先重新抽取世界，而不是续写。",
+                "target_character_id": None,
+                "target_clue_id": None,
+                "target_event_id": None,
+            },
+        ]
+
+    @classmethod
+    def _activate_continuation_chapter(
+        cls,
+        story_data: Dict[str, Any],
+        play_state: Dict[str, Any],
+        protagonist: Optional[Dict[str, Any]],
+        reason: str = "",
+    ) -> bool:
+        if reason in {"choice", "manual", "tick"} and cls._continuation_repetition_count(story_data, play_state) >= 1:
+            cls._queue_continuation_blocked_message(play_state, story_data)
+            logger.info(
+                "Story continuation blocked: repeated synthetic chapter world=%s reason=%s",
+                story_data.get("story_id", "unknown"),
+                reason or "unknown",
+            )
+            return False
+        world_state = WorldState(**_world_state_dict(story_data))
+        continuation = story_data.get("continuation") or ContinuationEngine.generate(story_data, world_state)
+        story_data["continuation"] = continuation
+        next_blocks = continuation.get("next_narrative_blocks") or []
+        if not next_blocks:
+            logger.info("Story continuation skipped: no next blocks world=%s", story_data.get("story_id", "unknown"))
+            return False
+
+        chapter_index = int(play_state.get("continuation_chapter_index") or 0) + 1
+        event_prefix = f"continuation_{chapter_index}_event_"
+        if any(str(item.get("id", "")).startswith(event_prefix) for item in story_data.get("events", [])):
+            play_state["chapter_complete"] = False
+            return True
+
+        protagonist_id = (protagonist or {}).get("id") or (world_state.player_state or {}).get("protagonist_id")
+        speaking_ids = cls._continuation_speakers(story_data, protagonist_id)
+        scene_id = world_state.current_scene_id or ((story_data.get("scenes") or [{}])[0].get("id"))
+        base_order = max([int(item.get("order", 0) or 0) for item in story_data.get("events", [])] or [0])
+
+        new_events: List[Dict[str, Any]] = []
+        new_blocks: List[Dict[str, Any]] = []
+        new_beats: List[Dict[str, Any]] = []
+        for idx, block in enumerate(next_blocks[:1], start=1):
+            event_id = f"{event_prefix}{idx}"
+            block_id = f"continuation_{chapter_index}_block_{idx}"
+            beat_id = f"continuation_{chapter_index}_beat_{idx}"
+            situation = cls._continuation_situation(story_data, block, idx)
+            objective = NarrativeEventAdapter._clean_text(block.get("objective", "")) or "判断上一轮留下的沉默，究竟会把谁推到你面前。"
+            risk = NarrativeEventAdapter._clean_text(block.get("risk", "")) or "你越急着找答案，越容易让别人先读懂你的判断。"
+            title = cls._continuation_event_title(block, idx)
+            participants = list(dict.fromkeys([item for item in [protagonist_id, *speaking_ids] if item]))
+
+            new_events.append({
+                "id": event_id,
+                "title": title,
+                "summary": situation,
+                "order": base_order + idx,
+                "actor": protagonist_id or "",
+                "action": "推进",
+                "target": speaking_ids[0] if speaking_ids else "",
+                "event_type": "plot",
+                "participants": participants,
+                "scenes": [scene_id] if scene_id else [],
+                "clues": [],
+                "status": "pending",
+                "trigger_conditions": ["上一章已收束"],
+                "preconditions": ["玩家选择继续游玩"],
+                "consequences": [situation],
+                "outcomes": [situation],
+                "caused_by": [world_state.current_event_id] if world_state.current_event_id else [],
+                "leads_to": [],
+                "tags": ["main", "continuation"],
+                "is_key_node": idx == 1,
+                "source": "continuation_engine",
+            })
+            new_blocks.append({
+                "id": block_id,
+                "title": title,
+                "summary": situation,
+                "situation": situation,
+                "conflict": NarrativeEventAdapter._clean_text(block.get("conflict", "")) or "上一轮的问题没有消失，只是换了一种方式回到桌面。",
+                "player_implication": "你不再是在重复试探，而是在处理上一轮选择留下的后果。",
+                "risk": risk,
+                "objective": objective,
+                "action_vectors": [
+                    "让对方继续说完，但只记录最反常的细节",
+                    "抓住刚才那处矛盾，直接把问题压回去",
+                    "暂时不表态，先看谁急着替局面下结论",
+                ],
+                "event_ids": [event_id],
+                "participant_ids": participants,
+                "clue_ids": [],
+                "scene_id": scene_id,
+                "phase": "continuation_setup" if idx == 1 else "confrontation",
+            })
+            new_beats.append({
+                "beat_id": beat_id,
+                "source_event_ids": [event_id],
+                "source_block_id": block_id,
+                "importance": "major",
+                "first_person_situation": situation,
+                "player_objective": objective,
+                "dramatic_question": "你要不要把上一轮留下的问题继续追下去？",
+                "present_character_ids": speaking_ids[:2],
+                "suggested_action_intents": ["continue_listen", "press_character", "observe"],
+                "revealed_clue_ids": [],
+                "risk_summary": risk,
+                "should_render_full_turn": True,
+                "scene_id": scene_id,
+                "phase": "continuation_setup" if idx == 1 else "confrontation",
+            })
+
+        story_data.setdefault("events", []).extend(new_events)
+        story_data.setdefault("narrative_blocks", []).extend(new_blocks)
+        story_data.setdefault("playable_beats", []).extend(new_beats)
+        story_data.setdefault("continuation_history", []).append({
+            "chapter_index": chapter_index,
+            "event_ids": [item["id"] for item in new_events],
+            "created_at": _now_iso(),
+            "reason": reason,
+        })
+        play_state["continuation_chapter_index"] = chapter_index
+        play_state["chapter_complete"] = False
+        play_state["current_decision"] = None
+        play_state["active_plot_node_id"] = None
+        world_state.phase = "continuation_setup"
+        world_state.current_event_id = None
+        world_state.candidate_event_ids = []
+        story_data["world_state"] = world_state.__dict__
+        PlayEventQueue.ensure(story_data, world_state, play_state)
+        PlotDirector.queue_messages(
+            play_state,
+            story_data,
+            [
+                NarrativeEventAdapter._message(
+                    "system",
+                    "你没有再停在原地。上一轮的委托、款项和沉默被收进记忆里，新的冲突开始沿着这些痕迹长出来。",
+                    metadata={"kind": "continuation_started", "layer": "system"},
+                )
+            ],
+            immediate=True,
+        )
+        logger.info(
+            "Story continuation activated: world=%s chapter=%s events=%s reason=%s",
+            story_data.get("story_id", "unknown"),
+            chapter_index,
+            len(new_events),
+            reason or "unknown",
+        )
+        return True
+
+    @classmethod
+    def _continuation_repetition_count(cls, story_data: Dict[str, Any], play_state: Dict[str, Any]) -> int:
+        history_count = len(story_data.get("continuation_history") or [])
+        current_count = int(play_state.get("continuation_chapter_index") or 0)
+        return max(history_count, current_count)
+
+    @classmethod
+    def _queue_continuation_blocked_message(cls, play_state: Dict[str, Any], story_data: Dict[str, Any]) -> None:
+        PlotDirector.queue_messages(
+            play_state,
+            story_data,
+            [
+                NarrativeEventAdapter._message(
+                    "system",
+                    "这一章已经收束。继续重复同一场会面只会让款项、委托和沉默原地打转；如果要开新篇章，请去续写页生成新的冲突。",
+                    metadata={"kind": "continuation_blocked", "layer": "system"},
+                )
+            ],
+            immediate=True,
+        )
+
+    @classmethod
+    def _continuation_speakers(cls, story_data: Dict[str, Any], protagonist_id: Optional[str]) -> List[str]:
+        ids: List[str] = []
+        world_state = _world_state_dict(story_data)
+        target_ids = ((world_state.get("player_state") or {}).get("targets") or [])
+        for char_id in target_ids:
+            character = CharacterRegistry.get_character(story_data, char_id, require_speaking=True)
+            if character and char_id != protagonist_id:
+                ids.append(char_id)
+        for character in story_data.get("characters", []) or []:
+            char_id = character.get("id")
+            name = character.get("canonical_name") or character.get("name") or ""
+            if char_id == protagonist_id or char_id in ids:
+                continue
+            if name in {"朱汉杨", "许雪萍"} or character.get("can_speak"):
+                checked = CharacterRegistry.get_character(story_data, char_id, require_speaking=True)
+                if checked:
+                    ids.append(char_id)
+            if len(ids) >= 2:
+                break
+        return ids[:2]
+
+    @classmethod
+    def _continuation_situation(cls, story_data: Dict[str, Any], block: Dict[str, Any], idx: int) -> str:
+        raw = NarrativeEventAdapter._clean_text(block.get("situation", ""))
+        if raw and not CharacterDialogueDirector._has_runtime_title_pollution(raw) and "这一段发生在" not in raw:
+            return raw[:220]
+        if idx == 1:
+            return "你把刚才的问题留在桌面上，空气没有立刻松开。十三个人仍在等你的下一次判断，而朱汉杨眼里的焦虚比他的措辞更诚实。"
+        if idx == 2:
+            return "款项已经退回，多余的零却没有从局面里消失。它像一枚明摆着的试探，逼你判断这场委托到底是谁在出价。"
+        return "上一轮留下的沉默开始发酵。有人希望你只看见交易本身，也有人正等你发现这笔交易背后真正要被隐藏的人。"
+
+    @classmethod
+    def _continuation_event_title(cls, block: Dict[str, Any], idx: int) -> str:
+        raw = NarrativeEventAdapter._clean_text(block.get("title", ""))
+        if raw and not CharacterDialogueDirector._has_runtime_title_pollution(raw) and raw not in {"滑膛告知", "滑膛发现"}:
+            return raw[:24]
+        titles = ["余波重新开口", "款项后的试探", "沉默里的第二层委托"]
+        return titles[min(idx - 1, len(titles) - 1)]
+
+    @classmethod
     def submit_player_input(cls, story_data: Dict[str, Any], player_input: str) -> Dict[str, Any]:
         play_state = cls.ensure_play_state(story_data)
+        if play_state.get("chapter_complete"):
+            play_state["feed"].append(
+                NarrativeEventAdapter._message(
+                    "player",
+                    player_input,
+                    author="你",
+                    metadata={"kind": "player_input"},
+                )
+            )
+            feedback = {
+                "summary": "当前导入的可玩节拍已经到末尾。系统不会在游玩页里自动生成新冲突；如果原文还没结束，请重新抽取世界补齐后续剧情。",
+                "impact": "自由输入已记录，但不会再用同一场景反复包装成新一轮对话。",
+            }
+            play_state["latest_feedback"] = feedback
+            PlotDirector.queue_messages(play_state, story_data, NarrativeEventAdapter.player_feedback_messages(feedback), immediate=True)
+            logger.info("Story player input ignored at exhausted queue: text=%s", NarrativeEventAdapter._truncate(player_input, 80))
+            return {"intent": "chapter_complete", "message": feedback["summary"], "data": None}
+
         world_state = WorldState(**_world_state_dict(story_data))
         result = PlayerInteractionService.execute(story_data, world_state, player_input)
         story_data["world_state"] = world_state.__dict__
@@ -3037,9 +3967,11 @@ class ChatDrivenPlayRuntimeService:
         play_state["current_decision"] = None
         play_state["active_plot_node_id"] = None
         PlotDirector.nudge_after_player_action(play_state, story_data, fast=result.get("intent") == "advance_story")
+        auto_advanced = cls._advance_next_event_once(story_data, play_state, ProtagonistResolver.resolve(story_data))
         logger.info(
-            "Story player input: intent=%s text=%s next_targets=%s",
+            "Story player input: intent=%s auto_advanced=%s text=%s next_targets=%s",
             result.get("intent", ""),
+            auto_advanced,
             NarrativeEventAdapter._truncate(player_input, 80),
             ",".join(((world_state.player_state or {}).get("targets") or [])) or "none",
         )
@@ -3054,6 +3986,67 @@ class ChatDrivenPlayRuntimeService:
         selected = next((item for item in option_pool if item["id"] == option_id), None)
         if not selected:
             return {"success": False, "message": "无效选项。"}
+
+        if selected.get("action_type") == "continue_chapter":
+            if not play_state.get("chapter_complete"):
+                if any(item.get("status") == "pending" for item in play_state.get("event_queue", [])):
+                    cls._append_manual_advance_marker(play_state)
+                    advanced = cls._advance_next_event_once(story_data, play_state, ProtagonistResolver.resolve(story_data))
+                    logger.info("Story stale continue choice advanced pending event: option=%s advanced=%s", option_id, advanced)
+                    return {
+                        "success": True,
+                        "choice": selected,
+                        "feedback": {
+                            "summary": "你继续往前走，系统接上了已经打开的下一拍。",
+                            "impact": "没有再重复创建新的篇章。",
+                        },
+                    }
+                return {"success": False, "message": "当前已经不在章节收束节点。"}
+            if cls._continuation_repetition_count(story_data, play_state) >= 1:
+                feedback = {
+                    "summary": "这一章已经收束。再重复进入下一篇章，只会把同一场会面重新包装一遍。",
+                    "impact": "如果原文还没结束，请回到总览重新抽取世界；如果原文已结束，再去续写页。",
+                }
+                PlotDirector.queue_messages(play_state, story_data, NarrativeEventAdapter.player_feedback_messages(feedback), immediate=True)
+                play_state["latest_feedback"] = feedback
+                return {"success": False, "message": feedback["summary"], "feedback": feedback}
+            feedback = {
+                "summary": "当前导入的可玩节拍已经到末尾。系统不会在游玩页里自动生成新冲突。",
+                "impact": "如果原文还没结束，请重新抽取世界；如果原文已结束，再进入续写页。",
+            }
+            play_state["latest_feedback"] = feedback
+            PlotDirector.queue_messages(play_state, story_data, NarrativeEventAdapter.player_feedback_messages(feedback), immediate=True)
+            play_state["current_decision"] = None
+            play_state["active_plot_node_id"] = None
+            logger.info("Story player choice reached exhausted queue: option=%s", option_id)
+            return {"success": True, "choice": selected, "feedback": feedback}
+
+        if selected.get("action_type") == "review_chapter":
+            if (current_turn.get("last_action") or "") == selected["label"]:
+                return {"success": False, "message": "这一轮信息已经梳理过了。"}
+            feedback = {
+                "summary": "你暂时没有继续推进，而是把已经暴露的信息重新压回脑子里：委托是真的，款项是试探，沉默也是一种报价。",
+                "impact": "如果原文还没结束，请重新抽取世界补齐后续剧情；如果原文已结束，再进入续写页。",
+            }
+            play_state["feed"].append(
+                NarrativeEventAdapter._message(
+                    "player",
+                    selected["label"],
+                    author="你",
+                    metadata={"kind": "choice", "option_id": option_id},
+                )
+            )
+            PlotDirector.queue_messages(play_state, story_data, NarrativeEventAdapter.player_feedback_messages(feedback), immediate=True)
+            play_state["latest_feedback"] = feedback
+            if play_state.get("current_turn"):
+                play_state["current_turn"]["last_action"] = selected["label"]
+                play_state["current_turn"]["latest_feedback"] = feedback
+                play_state["current_turn"]["actions"] = [
+                    item for item in cls._chapter_complete_actions()
+                    if item.get("action_type") == "open_continuation"
+                ]
+            logger.info("Story player choice reviewed chapter: option=%s", option_id)
+            return {"success": True, "choice": selected, "feedback": feedback}
 
         feedback = ActionResolutionEngine.apply_choice(story_data, selected)
         play_state["feed"].append(
@@ -3088,10 +4081,12 @@ class ChatDrivenPlayRuntimeService:
         play_state["current_decision"] = None
         play_state["active_plot_node_id"] = None
         PlotDirector.nudge_after_player_action(play_state, story_data, fast=True)
+        auto_advanced = cls._advance_next_event_once(story_data, play_state, ProtagonistResolver.resolve(story_data))
         logger.info(
-            "Story player choice: action_type=%s target=%s label=%s",
+            "Story player choice: action_type=%s target=%s auto_advanced=%s label=%s",
             selected.get("action_type", ""),
             selected.get("target_character_id") or selected.get("target_clue_id") or "none",
+            auto_advanced,
             NarrativeEventAdapter._truncate(selected.get("label", ""), 80),
         )
         return {"success": True, "choice": selected, "feedback": feedback}
@@ -3106,8 +4101,67 @@ class ChatDrivenPlayRuntimeService:
         play_state["turn_history"] = history[-10:]
 
     @classmethod
-    def _turn_needs_refresh(cls, turn: Optional[Dict[str, Any]]) -> bool:
+    def _sync_current_turn_messages(cls, story_data: Dict[str, Any], play_state: Dict[str, Any]) -> None:
+        current_turn = play_state.get("current_turn") or {}
+        event_id = current_turn.get("event_id")
+        if not event_id:
+            return
+        repair_key = f"feed_repaired:{event_id}"
+        if (current_turn.get("compression_mode") or "") in {"transition", "background"}:
+            current_turn["feed_repair_marker"] = repair_key
+            return
+        existing_messages = list(play_state.get("feed") or []) + list(play_state.get("pending_messages") or [])
+        existing_for_event = [
+            item
+            for item in existing_messages
+            if (item.get("metadata") or {}).get("event_id") == event_id
+        ]
+        has_event_message = bool(existing_for_event)
+        has_character_message = any(item.get("type") == "character" for item in existing_for_event)
+        needs_character_message = bool(current_turn.get("dialogues")) and not has_character_message
+        if current_turn.get("feed_repair_marker") == repair_key and not needs_character_message:
+            return
+        if has_event_message and not needs_character_message:
+            current_turn["feed_repair_marker"] = repair_key
+            return
+        event = next((item for item in story_data.get("events", []) if item.get("id") == event_id), None)
+        if not event:
+            current_turn["feed_repair_marker"] = repair_key
+            return
+        messages = NarrativeEventAdapter.event_messages(
+            story_data,
+            event,
+            current_turn,
+            previous_turn={},
+        )
+        messages = [
+            item for item in NarrativeEventAdapter.sanitize_visible_messages(messages, story_data)
+            if (item.get("metadata") or {}).get("kind") not in {"scene_transition"}
+        ]
+        if has_event_message and needs_character_message:
+            messages = [item for item in messages if item.get("type") == "character"]
+        if not messages:
+            current_turn["feed_repair_marker"] = repair_key
+            return
+        logger.info(
+            "Story feed repaired from current_turn: event=%s messages=%s",
+            _event_debug_label(event),
+            len(messages),
+        )
+        PlotDirector.queue_messages(play_state, story_data, messages, immediate=True)
+        current_turn["feed_repair_marker"] = repair_key
+
+    @classmethod
+    def _turn_needs_refresh(cls, turn: Optional[Dict[str, Any]], play_state: Optional[Dict[str, Any]] = None) -> bool:
         if not turn:
+            return True
+        if (
+            turn.get("should_render_full_turn", True)
+            and not turn.get("actions")
+            and not turn.get("last_action")
+            and not (play_state or {}).get("current_decision")
+            and turn.get("source_unit") == "playable_beat"
+        ):
             return True
         if turn.get("source_unit") == "playable_beat" and turn.get("beat_id"):
             required = [turn.get("situation"), turn.get("objective"), turn.get("risk")]

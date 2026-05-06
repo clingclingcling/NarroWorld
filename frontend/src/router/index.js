@@ -1,16 +1,17 @@
 import { createRouter, createWebHistory } from 'vue-router'
-import Home from '../views/Home.vue'
-import CreateWorldView from '../views/CreateWorldView.vue'
-import WorldOverviewView from '../views/WorldOverviewView.vue'
-import WorldPlayView from '../views/WorldPlayView.vue'
-import WorldDebugView from '../views/WorldDebugView.vue'
-import WorldContinuationView from '../views/WorldContinuationView.vue'
 
-import Process from '../views/MainView.vue'
-import SimulationView from '../views/SimulationView.vue'
-import SimulationRunView from '../views/SimulationRunView.vue'
-import ReportView from '../views/ReportView.vue'
-import InteractionView from '../views/InteractionView.vue'
+const Home = () => import('../views/Home.vue')
+const CreateWorldView = () => import('../views/CreateWorldView.vue')
+const WorldOverviewView = () => import('../views/WorldOverviewView.vue')
+const WorldPlayView = () => import('../views/WorldPlayView.vue')
+const WorldDebugView = () => import('../views/WorldDebugView.vue')
+const WorldContinuationView = () => import('../views/WorldContinuationView.vue')
+
+const Process = () => import('../views/MainView.vue')
+const SimulationView = () => import('../views/SimulationView.vue')
+const SimulationRunView = () => import('../views/SimulationRunView.vue')
+const ReportView = () => import('../views/ReportView.vue')
+const InteractionView = () => import('../views/InteractionView.vue')
 
 const routes = [
   {

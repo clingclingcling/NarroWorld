@@ -548,7 +548,25 @@ class StoryGenerationJobManager:
         if not os.path.exists(path):
             return None
         with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
+            raw = f.read()
+        try:
+            return json.loads(raw)
+        except JSONDecodeError:
+            recovered = cls._recover_job_json(raw)
+            if not recovered:
+                return {
+                    "job_id": job_id,
+                    "status": "failed",
+                    "stage": "load_job",
+                    "message": "生成任务状态文件损坏。",
+                    "progress": 0,
+                    "world_id": "",
+                    "error": "job.json is corrupted",
+                    "updated_at": _now_iso(),
+                }
+            backup_path = f"{path}.corrupt.{datetime.now().strftime('%Y%m%d%H%M%S')}"
+            shutil.copy2(path, backup_path)
+            return cls.save_job(recovered)
 
     @classmethod
     def update_job(cls, job_id: str, **updates: Any) -> Optional[Dict[str, Any]]:
@@ -559,3 +577,12 @@ class StoryGenerationJobManager:
             if value is not None:
                 payload[key] = value
         return cls.save_job(payload)
+
+    @classmethod
+    def _recover_job_json(cls, raw: str) -> Optional[Dict[str, Any]]:
+        decoder = json.JSONDecoder()
+        try:
+            data, _ = decoder.raw_decode(raw)
+        except JSONDecodeError:
+            return None
+        return data if isinstance(data, dict) else None

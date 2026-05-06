@@ -9,7 +9,7 @@ import warnings
 # 需要在所有其他导入之前设置
 warnings.filterwarnings("ignore", message=".*resource_tracker.*")
 
-from flask import Flask, request
+from flask import Flask, abort, request, send_from_directory
 from flask_cors import CORS
 
 from .config import Config
@@ -73,6 +73,25 @@ def create_app(config_class=Config):
     @app.route('/health')
     def health():
         return {'status': 'ok', 'service': 'NarraWorld Backend'}
+
+    # 生产环境：同域托管 Vite 构建后的前端，避免跨域、SSE 代理和多服务部署问题。
+    frontend_dist = os.environ.get(
+        'FRONTEND_DIST_DIR',
+        os.path.abspath(os.path.join(os.path.dirname(__file__), '../../frontend/dist')),
+    )
+
+    if os.path.isdir(frontend_dist):
+        @app.route('/', defaults={'path': ''})
+        @app.route('/<path:path>')
+        def serve_frontend(path):
+            if path.startswith('api/'):
+                abort(404)
+
+            requested_path = os.path.join(frontend_dist, path)
+            if path and os.path.isfile(requested_path):
+                return send_from_directory(frontend_dist, path)
+
+            return send_from_directory(frontend_dist, 'index.html')
     
     if should_log_startup:
         logger.info("NarraWorld Backend 启动完成")
