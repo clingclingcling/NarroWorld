@@ -302,11 +302,13 @@ class TurnQualityGate:
             return signals.get("main_conflict") or signals.get("relationship_change") or (
                 signals.get("new_information") and signals.get("meaningful_actions")
             )
-        return hard_signals >= 1 and (
-            signals.get("meaningful_actions")
-            or signals.get("clue_or_secret")
-            or signals.get("relationship_change")
-            or signals.get("new_information")
+        return bool(
+            signals.get("clue_or_secret")
+            or (
+                signals.get("relationship_change")
+                and signals.get("meaningful_actions")
+                and (signals.get("risk_change") or signals.get("objective_change"))
+            )
         )
 
     @classmethod
@@ -3473,7 +3475,11 @@ class ChatDrivenPlayRuntimeService:
             play_state["last_tick_at"] = _now_iso()
             return play_state
         if trigger == "manual" and not play_state.get("chapter_complete"):
-            cls._append_manual_advance_marker(play_state)
+            director = PlotDirector.ensure_state(play_state, story_data)
+            director["next_story_beat_at"] = _now_iso()
+            pending = play_state.get("pending_messages") or []
+            if pending:
+                pending[0]["available_at"] = _now_iso()
         if play_state.get("chapter_complete"):
             # Play runtime should not silently invent a new conflict when the
             # current queue ends. The continuation page is the explicit place
@@ -3641,17 +3647,7 @@ class ChatDrivenPlayRuntimeService:
 
     @classmethod
     def _append_manual_advance_marker(cls, play_state: Dict[str, Any]) -> None:
-        feed = play_state.setdefault("feed", [])
-        if feed and (feed[-1].get("metadata") or {}).get("kind") == "manual_advance":
-            return
-        feed.append(
-            NarrativeEventAdapter._message(
-                "player",
-                "继续推进",
-                author="你",
-                metadata={"kind": "manual_advance", "trigger": "manual"},
-            )
-        )
+        return
 
     @classmethod
     def _handle_queue_exhausted(
