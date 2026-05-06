@@ -951,7 +951,11 @@ class NarrativeEventAdapter:
     def _sanitize_message(cls, message: Dict[str, Any], story_data: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
         payload = dict(message)
         text = cls._clean_text(payload.get("text", ""))
-        msg_type = cls._normalize_message_type(payload.get("type", "system"), payload.get("metadata") or {})
+        metadata = payload.get("metadata") or {}
+        kind = cls._clean_text(metadata.get("kind", "")).lower()
+        if kind in {"manual_advance", "manual_tick_blocked"}:
+            return None
+        msg_type = cls._normalize_message_type(payload.get("type", "system"), metadata)
         author = payload.get("author", "")
         character_id = payload.get("character_id")
 
@@ -3629,21 +3633,7 @@ class ChatDrivenPlayRuntimeService:
 
     @classmethod
     def _queue_manual_blocked_message(cls, play_state: Dict[str, Any], story_data: Dict[str, Any]) -> None:
-        existing = list(play_state.get("feed") or []) + list(play_state.get("pending_messages") or [])
-        if existing and (existing[-1].get("metadata") or {}).get("kind") == "manual_tick_blocked":
-            return
-        PlotDirector.queue_messages(
-            play_state,
-            story_data,
-            [
-                NarrativeEventAdapter._message(
-                    "system",
-                    "这是一个需要你表态的节点。先选一个动作，或直接用自由输入开口；系统不会替你跳过这一步。",
-                    metadata={"kind": "manual_tick_blocked", "layer": "system", "trigger": "manual"},
-                )
-            ],
-            immediate=True,
-        )
+        return
 
     @classmethod
     def _append_manual_advance_marker(cls, play_state: Dict[str, Any]) -> None:

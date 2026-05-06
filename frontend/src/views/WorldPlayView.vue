@@ -168,6 +168,7 @@ let allowReconnect = true
 
 const NOISY_NAMES = new Set(['消息', '一秒', '公司', '警方', '监控', '线索', '秘密', '什么', '这样', '这时', '时间', '家里'])
 const FEED_TYPES = new Set(['system', 'character', 'player', 'feedback', 'clue', 'scene'])
+const HIDDEN_FEED_KINDS = new Set(['manual_advance', 'manual_tick_blocked'])
 
 const currentTurn = computed(() => playState.value?.current_turn || null)
 
@@ -252,7 +253,7 @@ const showPlayProgress = computed(() => {
 })
 
 const feedMessages = computed(() => {
-  return mergeFeed([], playState.value?.feed || [])
+  return compactFeedForDisplay(mergeFeed([], playState.value?.feed || []))
 })
 
 const relatedCharacters = computed(() => {
@@ -348,6 +349,7 @@ const normalizeFeedMessage = (message) => {
   const metadata = message.metadata || {}
   let type = String(message.type || '').trim().toLowerCase()
   const kind = String(metadata.kind || '').trim().toLowerCase()
+  if (HIDDEN_FEED_KINDS.has(kind)) return null
   if (kind === 'player_feedback' || type === 'feedback') type = 'feedback'
   else if (kind.includes('scene') || type === 'scene') type = 'scene'
   else if (kind.includes('clue') || type === 'clue') type = 'clue'
@@ -362,6 +364,40 @@ const normalizeFeedMessage = (message) => {
     author: String(message.author || '').trim(),
     metadata
   }
+}
+
+const isCompactibleSystemMessage = (message) => {
+  const kind = String(message?.metadata?.kind || '').trim().toLowerCase()
+  if (message?.type !== 'system') return false
+  if (kind === 'world_intro') return false
+  return ['narration', 'background', 'context_note', 'compressed_narration', 'transition', 'memory', 'memory_flash'].includes(kind) || !kind
+}
+
+const compactFeedForDisplay = (messages = []) => {
+  const compacted = []
+  let systemRun = []
+
+  const flushSystemRun = () => {
+    if (!systemRun.length) return
+    if (systemRun.length <= 2) {
+      compacted.push(...systemRun)
+    } else {
+      compacted.push(systemRun[0], systemRun[systemRun.length - 1])
+    }
+    systemRun = []
+  }
+
+  for (const message of messages) {
+    if (isCompactibleSystemMessage(message)) {
+      systemRun.push(message)
+      continue
+    }
+    flushSystemRun()
+    compacted.push(message)
+  }
+  flushSystemRun()
+
+  return compacted
 }
 
 const feedMessageKey = (message) => {
