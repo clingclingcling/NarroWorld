@@ -33,6 +33,7 @@ RUN uv sync --frozen --no-dev --no-install-project
 
 COPY backend ./
 COPY --from=frontend-build /app/frontend/dist /app/frontend/dist
+COPY locales /app/locales
 RUN uv sync --frozen --no-dev
 
 RUN mkdir -p /app/backend/uploads /app/backend/logs

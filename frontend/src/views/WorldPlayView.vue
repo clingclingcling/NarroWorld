@@ -213,7 +213,7 @@ const currentTurnSummary = computed(() => {
 })
 
 const visibleActionOptions = computed(() => {
-  const options = playState.value?.current_decision?.options || currentTurn.value?.actions || []
+  const options = playState.value?.current_decision?.options || []
   return options
     .slice(0, 5)
     .map(option => ({

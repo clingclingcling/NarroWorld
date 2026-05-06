@@ -1017,6 +1017,16 @@ class NarrativeEventAdapter:
             cleaned,
         ).strip()
         cleaned = re.sub(
+            r"^你(?:正)?站在场景\s*\d+(?:\s*·\s*[^，。]{1,40})?[里中]?，",
+            "",
+            cleaned,
+        ).strip()
+        cleaned = re.sub(
+            r"^你(?:正)?站在场景\d+[里中]，",
+            "",
+            cleaned,
+        ).strip()
+        cleaned = re.sub(
             r"^你站在[^，。]{1,32}[里中]，所有人都在等你先露判断[。；，、\s]*",
             "",
             cleaned,
@@ -3363,7 +3373,8 @@ class ChatDrivenPlayRuntimeService:
         ):
             current_event_id = (play_state.get("current_turn") or {}).get("event_id")
             current_event = next((item for item in story_data.get("events", []) if item.get("id") == current_event_id), None)
-            if current_event:
+            current_turn = play_state.get("current_turn") or {}
+            if current_event and cls._turn_requires_player_decision(current_event, current_turn):
                 plot_node = MainPlotNodeManager.build_plot_node(story_data, current_event, protagonist)
                 if plot_node:
                     play_state["current_decision"] = asdict(plot_node)
@@ -3371,6 +3382,9 @@ class ChatDrivenPlayRuntimeService:
                 else:
                     play_state["current_decision"] = None
                     play_state["active_plot_node_id"] = None
+            else:
+                play_state["current_decision"] = None
+                play_state["active_plot_node_id"] = None
 
         PlotDirector.ensure_state(play_state, story_data)
         return play_state
@@ -3565,7 +3579,7 @@ class ChatDrivenPlayRuntimeService:
                 turn_messages,
                 immediate=True,
             )
-            if next_event.get("is_key_node") or "main" in next_event.get("tags", []):
+            if cls._turn_requires_player_decision(next_event, current_turn):
                 plot_node = MainPlotNodeManager.build_plot_node(story_data, next_event, protagonist)
                 if plot_node:
                     play_state["current_decision"] = asdict(plot_node)
@@ -3580,6 +3594,32 @@ class ChatDrivenPlayRuntimeService:
             PlotDirector.release_due_messages(play_state, story_data)
             return True
         return False
+
+    @classmethod
+    def _turn_requires_player_decision(cls, event: Dict[str, Any], turn: Dict[str, Any]) -> bool:
+        if not event or not turn:
+            return False
+        if not turn.get("should_render_full_turn", True):
+            return False
+        if turn.get("context_only"):
+            return False
+        if not turn.get("actions"):
+            return False
+
+        tags = set(event.get("tags") or [])
+        if event.get("is_key_node") or "main" in tags:
+            return True
+
+        gate = turn.get("quality_gate") or {}
+        signals = gate.get("signals") or {}
+        importance = gate.get("importance") or turn.get("importance")
+        meaningful_stop = (
+            signals.get("clue_or_secret")
+            or signals.get("risk_change")
+            or signals.get("objective_change")
+            or (signals.get("main_conflict") and importance == "major")
+        )
+        return bool(importance == "major" and meaningful_stop)
 
     @classmethod
     def _queue_manual_blocked_message(cls, play_state: Dict[str, Any], story_data: Dict[str, Any]) -> None:
