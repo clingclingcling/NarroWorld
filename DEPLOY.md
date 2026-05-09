@@ -60,7 +60,7 @@ ZEP_API_KEY=your_zep_key
 
 FLASK_DEBUG=false
 SECRET_KEY=replace_with_a_long_random_string
-APP_ACCESS_TOKEN=replace_with_a_private_demo_password
+APP_ACCESS_TOKEN=
 CORS_ORIGINS=*
 
 WEB_CONCURRENCY=1
@@ -107,10 +107,10 @@ docker compose logs -f --tail=100
 ```text
 http://服务器公网IP:5002
 http://服务器公网IP:5002/health
-http://服务器公网IP:5002/api/story/list?limit=1&access_token=你的_APP_ACCESS_TOKEN
+http://服务器公网IP:5002/api/story/list?limit=1
 ```
 
-首次打开网页调用 API 时，浏览器会提示输入 NarraWorld 访问口令；输入 `.env` 里的 `APP_ACCESS_TOKEN` 后会保存在当前浏览器本地。
+公开评审演示时保持 `APP_ACCESS_TOKEN=` 为空，评委打开链接即可使用。若后续需要临时保护公网 API，再把 `APP_ACCESS_TOKEN` 改成一串私密口令并重启容器。
 
 ## 更新部署
 

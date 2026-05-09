@@ -90,6 +90,4 @@ class Config:
             }
             if not cls.SECRET_KEY or cls.SECRET_KEY in weak_secret_keys or len(cls.SECRET_KEY) < 24:
                 errors.append("生产环境必须配置足够长且不可预测的 SECRET_KEY")
-            if not cls.APP_ACCESS_TOKEN or len(cls.APP_ACCESS_TOKEN) < 12:
-                errors.append("生产环境必须配置 APP_ACCESS_TOKEN，用于保护公网 API")
         return errors
