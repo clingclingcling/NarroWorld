@@ -1,6 +1,20 @@
 import axios from 'axios'
 import i18n from '../i18n'
 
+export const ACCESS_TOKEN_STORAGE_KEY = 'narraworld_access_token'
+
+export const getAccessToken = () => {
+  if (typeof window === 'undefined') return import.meta.env.VITE_NARRAWORLD_ACCESS_TOKEN || ''
+  return window.localStorage.getItem(ACCESS_TOKEN_STORAGE_KEY) || import.meta.env.VITE_NARRAWORLD_ACCESS_TOKEN || ''
+}
+
+export const setAccessToken = (token) => {
+  if (typeof window === 'undefined') return
+  const cleaned = String(token || '').trim()
+  if (cleaned) window.localStorage.setItem(ACCESS_TOKEN_STORAGE_KEY, cleaned)
+  else window.localStorage.removeItem(ACCESS_TOKEN_STORAGE_KEY)
+}
+
 // 创建axios实例
 const service = axios.create({
   baseURL: import.meta.env.VITE_API_BASE_URL || '',
@@ -14,6 +28,11 @@ const service = axios.create({
 service.interceptors.request.use(
   config => {
     config.headers['Accept-Language'] = i18n.global.locale.value
+    const accessToken = getAccessToken()
+    if (accessToken) {
+      config.headers['Authorization'] = `Bearer ${accessToken}`
+      config.headers['X-NarraWorld-Token'] = accessToken
+    }
     return config
   },
   error => {
@@ -35,8 +54,22 @@ service.interceptors.response.use(
     
     return res
   },
-  error => {
+  async error => {
     console.error('Response error:', error)
+
+    if (error.response?.status === 401 && !error.config?.__narraworldAuthRetry && typeof window !== 'undefined') {
+      const token = window.prompt('请输入 NarraWorld 访问口令')
+      if (token) {
+        setAccessToken(token)
+        error.config.__narraworldAuthRetry = true
+        error.config.headers = {
+          ...(error.config.headers || {}),
+          Authorization: `Bearer ${token}`,
+          'X-NarraWorld-Token': token
+        }
+        return service(error.config)
+      }
+    }
     
     // 处理超时
     if (error.code === 'ECONNABORTED' && error.message.includes('timeout')) {

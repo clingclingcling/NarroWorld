@@ -3,17 +3,35 @@ NarraWorld Backend - Flask应用工厂
 """
 
 import os
+import secrets
 import warnings
 
 # 抑制 multiprocessing resource_tracker 的警告（来自第三方库如 transformers）
 # 需要在所有其他导入之前设置
 warnings.filterwarnings("ignore", message=".*resource_tracker.*")
 
-from flask import Flask, abort, request, send_from_directory
+from flask import Flask, abort, jsonify, request, send_from_directory
 from flask_cors import CORS
 
 from .config import Config
 from .utils.logger import setup_logger, get_logger
+
+
+def _strip_traceback_fields(value):
+    if isinstance(value, dict):
+        changed = False
+        if 'traceback' in value:
+            value.pop('traceback', None)
+            changed = True
+        for item in value.values():
+            changed = _strip_traceback_fields(item) or changed
+        return changed
+    if isinstance(value, list):
+        changed = False
+        for item in value:
+            changed = _strip_traceback_fields(item) or changed
+        return changed
+    return False
 
 
 def create_app(config_class=Config):
@@ -38,9 +56,21 @@ def create_app(config_class=Config):
         logger.info("=" * 50)
         logger.info("NarraWorld Backend 启动中...")
         logger.info("=" * 50)
+
+    config_errors = config_class.validate()
+    if config_errors:
+        message = "；".join(config_errors)
+        if debug_mode:
+            logger.warning("配置警告: %s", message)
+        else:
+            raise RuntimeError(f"配置错误: {message}")
     
     # 启用CORS
-    CORS(app, resources={r"/api/*": {"origins": "*"}})
+    cors_origin_setting = app.config.get('CORS_ORIGINS', '*')
+    cors_origins = '*'
+    if cors_origin_setting and cors_origin_setting != '*':
+        cors_origins = [item.strip() for item in cors_origin_setting.split(',') if item.strip()]
+    CORS(app, resources={r"/api/*": {"origins": cors_origins}})
     
     # 注册模拟进程清理函数（确保服务器关闭时终止所有模拟进程）
     from .services.simulation_runner import SimulationRunner
@@ -55,11 +85,37 @@ def create_app(config_class=Config):
         logger.debug(f"请求: {request.method} {request.path}")
         if request.content_type and 'json' in request.content_type:
             logger.debug(f"请求体: {request.get_json(silent=True)}")
+
+    @app.before_request
+    def require_api_access_token():
+        if request.method == 'OPTIONS' or not request.path.startswith('/api/'):
+            return None
+
+        expected_token = (app.config.get('APP_ACCESS_TOKEN') or '').strip()
+        if not expected_token:
+            return None
+
+        auth_header = request.headers.get('Authorization', '').strip()
+        provided_token = ''
+        if auth_header.lower().startswith('bearer '):
+            provided_token = auth_header[7:].strip()
+        provided_token = provided_token or request.headers.get('X-NarraWorld-Token', '').strip()
+        # EventSource cannot set custom headers, so SSE clients may pass the
+        # same token as a query parameter. Keep this limited to API calls.
+        provided_token = provided_token or request.args.get('access_token', '').strip()
+
+        if not secrets.compare_digest(provided_token, expected_token):
+            return jsonify({"success": False, "error": "需要 NarraWorld 访问口令"}), 401
+        return None
     
     @app.after_request
     def log_response(response):
         logger = get_logger('narraworld.request')
         logger.debug(f"响应: {response.status_code}")
+        if not app.config.get('EXPOSE_TRACEBACK') and response.is_json:
+            payload = response.get_json(silent=True)
+            if payload is not None and _strip_traceback_fields(payload):
+                response.set_data(app.json.dumps(payload))
         return response
     
     # 注册蓝图

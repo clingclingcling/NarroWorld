@@ -60,6 +60,8 @@ ZEP_API_KEY=your_zep_key
 
 FLASK_DEBUG=false
 SECRET_KEY=replace_with_a_long_random_string
+APP_ACCESS_TOKEN=replace_with_a_private_demo_password
+CORS_ORIGINS=*
 
 WEB_CONCURRENCY=1
 GUNICORN_THREADS=8
@@ -105,8 +107,10 @@ docker compose logs -f --tail=100
 ```text
 http://服务器公网IP:5002
 http://服务器公网IP:5002/health
-http://服务器公网IP:5002/api/story/list?limit=1
+http://服务器公网IP:5002/api/story/list?limit=1&access_token=你的_APP_ACCESS_TOKEN
 ```
+
+首次打开网页调用 API 时，浏览器会提示输入 NarraWorld 访问口令；输入 `.env` 里的 `APP_ACCESS_TOKEN` 后会保存在当前浏览器本地。
 
 ## 更新部署
 

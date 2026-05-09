@@ -12,6 +12,7 @@ from threading import Thread
 from flask import Response, jsonify, request, stream_with_context
 
 from . import story_bp
+from ..config import Config
 from ..models.story import StoryGenerationJobManager, StoryProjectManager
 from ..services.story_cleaner import StoryDataSanitizer
 from ..services.story_extractor import StoryExtractionService
@@ -22,6 +23,17 @@ from ..utils.file_parser import FileParser
 from ..utils.logger import get_logger
 
 logger = get_logger("narraworld.api.story")
+
+
+def _error_response(public_message: str, exc: Exception, status_code: int = 500):
+    logger.debug(traceback.format_exc())
+    payload = {
+        "success": False,
+        "error": f"{public_message}: {exc}" if Config.EXPOSE_TRACEBACK else public_message,
+    }
+    if Config.EXPOSE_TRACEBACK:
+        payload["traceback"] = traceback.format_exc()
+    return jsonify(payload), status_code
 
 
 def _allowed_story_file(filename: str) -> bool:
@@ -274,7 +286,7 @@ def _run_generation_job(job_id: str, story_id: str, title: str, genre: str, sour
             job_id,
             status="failed",
             message="世界生成失败。",
-            error=str(e),
+            error=str(e) if Config.EXPOSE_TRACEBACK else "请查看服务器日志。",
         )
 
 
@@ -307,7 +319,7 @@ def ingest_story():
         return jsonify({"success": True, "data": cleaned_payload})
     except Exception as e:
         logger.error(f"世界导入失败: {e}")
-        return jsonify({"success": False, "error": str(e), "traceback": traceback.format_exc()}), 500
+        return _error_response("世界导入失败，请查看服务器日志", e)
 
 
 @story_bp.route("/generate/start", methods=["POST"])
@@ -347,7 +359,7 @@ def start_story_generation():
         })
     except Exception as e:
         logger.error(f"启动世界生成失败: {e}")
-        return jsonify({"success": False, "error": str(e), "traceback": traceback.format_exc()}), 500
+        return _error_response("启动世界生成失败，请查看服务器日志", e)
 
 
 @story_bp.route("/generate/status/<job_id>", methods=["GET"])
@@ -572,7 +584,7 @@ def advance_story(story_id: str):
         return jsonify({"success": True, "data": result})
     except Exception as e:
         logger.error(f"推进剧情失败: {e}")
-        return jsonify({"success": False, "error": str(e), "traceback": traceback.format_exc()}), 500
+        return _error_response("推进剧情失败，请查看服务器日志", e)
 
 
 @story_bp.route("/<story_id>/player-action", methods=["POST"])
@@ -589,7 +601,7 @@ def player_action(story_id: str):
         return jsonify({"success": True, "data": result})
     except Exception as e:
         logger.error(f"玩家动作失败: {e}")
-        return jsonify({"success": False, "error": str(e), "traceback": traceback.format_exc()}), 500
+        return _error_response("玩家动作处理失败，请查看服务器日志", e)
 
 
 @story_bp.route("/<story_id>/play", methods=["GET"])
@@ -749,7 +761,7 @@ def tick_play(story_id: str):
         logger.error(f"剧情推进失败: {e}")
         _set_play_progress(story, "failed", "advance_failed", f"剧情推进失败：{e}", 100)
         _persist_story(story)
-        return jsonify({"success": False, "error": str(e), "traceback": traceback.format_exc()}), 500
+        return _error_response("剧情推进失败，请查看服务器日志", e)
 
 
 @story_bp.route("/<story_id>/play/input", methods=["POST"])
@@ -778,7 +790,7 @@ def play_input(story_id: str):
         logger.error(f"玩家输入处理失败: {e}")
         _set_play_progress(story, "failed", "input_failed", f"输入处理失败：{e}", 100)
         _persist_story(story)
-        return jsonify({"success": False, "error": str(e), "traceback": traceback.format_exc()}), 500
+        return _error_response("玩家输入处理失败，请查看服务器日志", e)
 
 
 @story_bp.route("/<story_id>/play/choice", methods=["POST"])
@@ -807,7 +819,7 @@ def play_choice(story_id: str):
         logger.error(f"玩家选项处理失败: {e}")
         _set_play_progress(story, "failed", "choice_failed", f"选项处理失败：{e}", 100)
         _persist_story(story)
-        return jsonify({"success": False, "error": str(e), "traceback": traceback.format_exc()}), 500
+        return _error_response("玩家选项处理失败，请查看服务器日志", e)
 
 
 @story_bp.route("/<story_id>/continuation", methods=["GET", "POST"])
@@ -823,4 +835,4 @@ def get_continuation(story_id: str):
         return jsonify({"success": True, "data": continuation})
     except Exception as e:
         logger.error(f"生成续写失败: {e}")
-        return jsonify({"success": False, "error": str(e), "traceback": traceback.format_exc()}), 500
+        return _error_response("生成续写失败，请查看服务器日志", e)

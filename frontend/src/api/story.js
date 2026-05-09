@@ -1,4 +1,20 @@
-import service, { requestWithRetry } from './index'
+import service, { getAccessToken, requestWithRetry } from './index'
+
+const appendQuery = (url, params = {}) => {
+  const entries = Object.entries(params).filter(([, value]) => value !== undefined && value !== null && value !== '')
+  if (!entries.length) return url
+  const query = entries
+    .map(([key, value]) => `${encodeURIComponent(key)}=${encodeURIComponent(value)}`)
+    .join('&')
+  return `${url}${url.includes('?') ? '&' : '?'}${query}`
+}
+
+const withAccessToken = (url, params = {}) => {
+  return appendQuery(url, {
+    ...params,
+    access_token: getAccessToken()
+  })
+}
 
 export const ingestStory = async (formData) => {
   return requestWithRetry(() => service({
@@ -28,7 +44,7 @@ export const getStoryGenerationStatus = async (jobId) => {
 
 export const getStoryGenerationStreamUrl = (jobId) => {
   const base = (import.meta.env.VITE_API_BASE_URL || '').replace(/\/$/, '')
-  return `${base}/api/story/generate/stream/${jobId}`
+  return withAccessToken(`${base}/api/story/generate/stream/${jobId}`)
 }
 
 export const listStories = async (limit = 20) => {
@@ -91,12 +107,12 @@ export const sendPlayChoice = async (storyId, data) => {
   return service.post(`/api/story/${storyId}/play/choice`, data)
 }
 
-export const getPlayStreamUrl = (storyId) => {
+export const getPlayStreamUrl = (storyId, cursor = 0) => {
   const base = (import.meta.env.VITE_API_BASE_URL || '').replace(/\/$/, '')
-  return `${base}/api/story/${storyId}/play/stream`
+  return withAccessToken(`${base}/api/story/${storyId}/play/stream`, { cursor })
 }
 
 export const getPlayProgressStreamUrl = (storyId) => {
   const base = (import.meta.env.VITE_API_BASE_URL || '').replace(/\/$/, '')
-  return `${base}/api/story/${storyId}/play/progress/stream`
+  return withAccessToken(`${base}/api/story/${storyId}/play/progress/stream`)
 }

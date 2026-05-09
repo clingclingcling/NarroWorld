@@ -4133,6 +4133,13 @@ class ChatDrivenPlayRuntimeService:
         if not event_id:
             return
         repair_key = f"feed_repaired:{event_id}"
+        # This is only a migration safety net for very old play states that
+        # have a current_turn but no feed at all. Once a feed exists, it is the
+        # single frontstage source of truth; regenerating messages from
+        # current_turn can re-introduce stale dialogue and spam SSE repair logs.
+        if play_state.get("feed") or play_state.get("pending_messages"):
+            current_turn["feed_repair_marker"] = repair_key
+            return
         if (current_turn.get("compression_mode") or "") in {"transition", "background"}:
             current_turn["feed_repair_marker"] = repair_key
             return

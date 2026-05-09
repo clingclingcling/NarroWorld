@@ -363,6 +363,7 @@ class StoryWorld:
 
 class StoryProjectManager:
     ROOT_DIR = os.path.join(Config.UPLOAD_FOLDER, "story_worlds")
+    SAFE_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
 
     @classmethod
     def ensure_root_dir(cls):
@@ -381,18 +382,19 @@ class StoryProjectManager:
     @classmethod
     def get_story_dir(cls, story_id: str) -> str:
         cls.ensure_root_dir()
-        path = os.path.join(cls.ROOT_DIR, story_id)
+        path = cls._story_dir_path(story_id)
         os.makedirs(path, exist_ok=True)
         return path
 
     @classmethod
     def get_existing_story_dir(cls, story_id: str) -> str:
         cls.ensure_root_dir()
-        return os.path.join(cls.ROOT_DIR, story_id)
+        return cls._story_dir_path(story_id)
 
     @classmethod
-    def get_story_meta_path(cls, story_id: str) -> str:
-        return os.path.join(cls.get_story_dir(story_id), "world.json")
+    def get_story_meta_path(cls, story_id: str, create: bool = True) -> str:
+        story_dir = cls.get_story_dir(story_id) if create else cls.get_existing_story_dir(story_id)
+        return os.path.join(story_dir, "world.json")
 
     @classmethod
     def get_story_files_dir(cls, story_id: str) -> str:
@@ -425,7 +427,10 @@ class StoryProjectManager:
 
     @classmethod
     def load_story(cls, story_id: str) -> Optional[Dict[str, Any]]:
-        path = cls.get_story_meta_path(story_id)
+        try:
+            path = cls.get_story_meta_path(story_id, create=False)
+        except ValueError:
+            return None
         if not os.path.exists(path):
             return None
         with open(path, "r", encoding="utf-8") as f:
@@ -446,6 +451,8 @@ class StoryProjectManager:
         cls.ensure_root_dir()
         stories = []
         for story_id in os.listdir(cls.ROOT_DIR):
+            if not cls.SAFE_ID_PATTERN.match(story_id):
+                continue
             data = cls.load_story(story_id)
             if data:
                 stories.append(data)
@@ -454,11 +461,25 @@ class StoryProjectManager:
 
     @classmethod
     def delete_story(cls, story_id: str) -> bool:
-        story_dir = cls.get_existing_story_dir(story_id)
+        try:
+            story_dir = cls.get_existing_story_dir(story_id)
+        except ValueError:
+            return False
         if not os.path.exists(story_dir):
             return False
         shutil.rmtree(story_dir)
         return True
+
+    @classmethod
+    def _story_dir_path(cls, story_id: str) -> str:
+        story_id = str(story_id or "").strip()
+        if not cls.SAFE_ID_PATTERN.match(story_id):
+            raise ValueError(f"非法世界 ID: {story_id}")
+        root = os.path.abspath(cls.ROOT_DIR)
+        path = os.path.abspath(os.path.join(root, story_id))
+        if not path.startswith(root + os.sep):
+            raise ValueError(f"非法世界路径: {story_id}")
+        return path
 
     @classmethod
     def _recover_story_json(cls, raw: str) -> Optional[Dict[str, Any]]:
@@ -477,6 +498,8 @@ class StoryProjectManager:
 
 class StoryGenerationJobManager:
     ROOT_DIR = os.path.join(Config.UPLOAD_FOLDER, "story_generation_jobs")
+    SAFE_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
+    STALE_RUNNING_SECONDS = 2 * 60 * 60
 
     @classmethod
     def ensure_root_dir(cls):
@@ -489,13 +512,19 @@ class StoryGenerationJobManager:
     @classmethod
     def get_job_dir(cls, job_id: str) -> str:
         cls.ensure_root_dir()
-        path = os.path.join(cls.ROOT_DIR, job_id)
+        path = cls._job_dir_path(job_id)
         os.makedirs(path, exist_ok=True)
         return path
 
     @classmethod
-    def get_job_meta_path(cls, job_id: str) -> str:
-        return os.path.join(cls.get_job_dir(job_id), "job.json")
+    def get_existing_job_dir(cls, job_id: str) -> str:
+        cls.ensure_root_dir()
+        return cls._job_dir_path(job_id)
+
+    @classmethod
+    def get_job_meta_path(cls, job_id: str, create: bool = True) -> str:
+        job_dir = cls.get_job_dir(job_id) if create else cls.get_existing_job_dir(job_id)
+        return os.path.join(job_dir, "job.json")
 
     @classmethod
     def create_job(
@@ -544,13 +573,16 @@ class StoryGenerationJobManager:
 
     @classmethod
     def load_job(cls, job_id: str) -> Optional[Dict[str, Any]]:
-        path = cls.get_job_meta_path(job_id)
+        try:
+            path = cls.get_job_meta_path(job_id, create=False)
+        except ValueError:
+            return None
         if not os.path.exists(path):
             return None
         with open(path, "r", encoding="utf-8") as f:
             raw = f.read()
         try:
-            return json.loads(raw)
+            return cls._mark_stale_if_needed(json.loads(raw))
         except JSONDecodeError:
             recovered = cls._recover_job_json(raw)
             if not recovered:
@@ -586,3 +618,33 @@ class StoryGenerationJobManager:
         except JSONDecodeError:
             return None
         return data if isinstance(data, dict) else None
+
+    @classmethod
+    def _mark_stale_if_needed(cls, payload: Dict[str, Any]) -> Dict[str, Any]:
+        if payload.get("status") not in {"pending", "running"}:
+            return payload
+        try:
+            updated_at = datetime.fromisoformat(payload.get("updated_at", ""))
+        except (TypeError, ValueError):
+            return payload
+        if (datetime.now() - updated_at).total_seconds() <= cls.STALE_RUNNING_SECONDS:
+            return payload
+        payload = dict(payload)
+        payload.update({
+            "status": "failed",
+            "stage": payload.get("stage") or "stale_job",
+            "message": "生成任务长时间没有更新，可能因服务重启而中断。",
+            "error": "generation job stale",
+        })
+        return cls.save_job(payload)
+
+    @classmethod
+    def _job_dir_path(cls, job_id: str) -> str:
+        job_id = str(job_id or "").strip()
+        if not cls.SAFE_ID_PATTERN.match(job_id):
+            raise ValueError(f"非法任务 ID: {job_id}")
+        root = os.path.abspath(cls.ROOT_DIR)
+        path = os.path.abspath(os.path.join(root, job_id))
+        if not path.startswith(root + os.sep):
+            raise ValueError(f"非法任务路径: {job_id}")
+        return path

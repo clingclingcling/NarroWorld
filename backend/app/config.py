@@ -9,12 +9,14 @@ from dotenv import load_dotenv
 # 加载项目根目录的 .env 文件
 # 路径: NarraWorld/.env (相对于 backend/app/config.py)
 project_root_env = os.path.join(os.path.dirname(__file__), '../../.env')
+_is_production_env = os.environ.get('FLASK_DEBUG', '').lower() in {'false', '0', 'no'} or os.environ.get('NARRAWORLD_ENV', '').lower() == 'production'
+_dotenv_override = not _is_production_env
 
 if os.path.exists(project_root_env):
-    load_dotenv(project_root_env, override=True)
+    load_dotenv(project_root_env, override=_dotenv_override)
 else:
     # 如果根目录没有 .env，尝试加载环境变量（用于生产环境）
-    load_dotenv(override=True)
+    load_dotenv(override=_dotenv_override)
 
 
 class Config:
@@ -23,6 +25,9 @@ class Config:
     # Flask配置
     SECRET_KEY = os.environ.get('SECRET_KEY', 'narraworld-secret-key')
     DEBUG = os.environ.get('FLASK_DEBUG', 'True').lower() == 'true'
+    APP_ACCESS_TOKEN = os.environ.get('APP_ACCESS_TOKEN', '').strip()
+    CORS_ORIGINS = os.environ.get('CORS_ORIGINS', '*')
+    EXPOSE_TRACEBACK = os.environ.get('EXPOSE_TRACEBACK', '').lower() in {'true', '1', 'yes'} or DEBUG
     
     # JSON配置 - 禁用ASCII转义，让中文直接显示（而不是 \uXXXX 格式）
     JSON_AS_ASCII = False
@@ -77,4 +82,14 @@ class Config:
             errors.append("LLM_API_KEY 未配置")
         if not cls.ZEP_API_KEY:
             errors.append("ZEP_API_KEY 未配置")
+        if not cls.DEBUG:
+            weak_secret_keys = {
+                '',
+                'narraworld-secret-key',
+                'replace_with_a_long_random_string',
+            }
+            if not cls.SECRET_KEY or cls.SECRET_KEY in weak_secret_keys or len(cls.SECRET_KEY) < 24:
+                errors.append("生产环境必须配置足够长且不可预测的 SECRET_KEY")
+            if not cls.APP_ACCESS_TOKEN or len(cls.APP_ACCESS_TOKEN) < 12:
+                errors.append("生产环境必须配置 APP_ACCESS_TOKEN，用于保护公网 API")
         return errors

@@ -434,7 +434,8 @@ const mergePlayState = (incoming) => {
 const connectStream = () => {
   if (!allowReconnect) return
   if (eventSource) eventSource.close()
-  eventSource = new EventSource(getPlayStreamUrl(worldId))
+  const cursor = playState.value?.feed?.length || 0
+  eventSource = new EventSource(getPlayStreamUrl(worldId, cursor))
 
   eventSource.addEventListener('init', async (event) => {
     const payload = JSON.parse(event.data)
